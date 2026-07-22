@@ -1,7 +1,8 @@
 # lantern-kernel — Architecture
 
 This document is the component-level companion to [wiki/Kernel](https://github.com/lantern-os/lantern-docs/blob/main/wiki/Kernel.md)
-and is bound by [RFC-0002](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0002-microkernel-architecture.md). Where this
+and is bound by [RFC-0002](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0002-microkernel-architecture.md) and
+[ADR-0004](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0004-kernel-responsibilities-and-tcb-boundary.md). Where this
 file and the wiki disagree, that is a bug — file an issue.
 
 ## Design goals (in priority order)
@@ -19,7 +20,9 @@ Modelled closely on seL4 because that design is *proven* implementable and verif
 - **Untyped memory** — raw physical memory, retyped by user space into typed objects. The
   sole source of allocation; the kernel never grows its own heap.
 - **CNode** — stores capabilities; CNodes compose into a per-process **CSpace**.
-- **TCB** — a thread; bound to a VSpace and a scheduling context.
+- **Thread control block (seL4 sense of "TCB")** — a thread; bound to a VSpace and a
+  scheduling context. Not to be confused with *Trusted Computing Base*, the other "TCB"
+  used throughout this document and the rest of the project.
 - **Endpoint** — synchronous call/reply rendezvous; supports **badges**.
 - **Notification** — asynchronous signal; bindable to IRQs.
 - **VSpace / page tables / Frame** — the address-space machinery.
