@@ -12,11 +12,13 @@
   [ADR-0009](../lantern-rfcs/adr/0009-phase1-scheduling-context-model.md)).
 
 ## Next
-- Concurrency model (single-stack vs. process-kernel) — still open post-RFC-0002, not
-  addressed by RFC-0005; see [ADR-0004](../lantern-rfcs/adr/0004-kernel-responsibilities-and-tcb-boundary.md).
+- [RFC-0006](../lantern-rfcs/rfcs/0006-kernel-concurrency-model.md) (Draft): kernel
+  concurrency model (single-stack, run-to-completion) — under review.
 - Phase 1 prototype: boot → address spaces → threads → IPC fast-path → capability mechanism,
-  on `riscv64`/x86-64 under QEMU, against the ADR-0008/ADR-0009 ABI.
+  on `riscv64`/x86-64 under QEMU, against the ADR-0008/ADR-0009 ABI — blocked on
+  RFC-0006 landing.
 
 ## Blocked on
-- HAL seam definition ([`lantern-hal`](../lantern-hal)) — now specified by ADR-0008's
-  "HAL contract this ABI requires," awaiting implementation.
+- Nothing on `lantern-hal` currently — both `riscv64` and `x86-64` trap entries are
+  implemented (`lantern-hal/STATUS.md`), satisfying ADR-0008's "HAL contract this ABI
+  requires." Prototype code is blocked on RFC-0006 above instead.
