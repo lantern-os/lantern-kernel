@@ -1,0 +1,14 @@
+[package]
+name = "lantern-kernel"
+version = "0.0.0"
+edition = "2021"
+description = "LanternOS microkernel — Phase 1 prototype (RFC-0004)"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "lantern_kernel"
+path = "src/lib.rs"
+
+[dependencies]
+lantern-hal = { git = "https://github.com/lantern-os/lantern-hal", branch = "main" }
