@@ -1,6 +1,6 @@
 # lantern-kernel — Status
 
-**Phase:** 1 (Microkernel prototype) — open per [RFC-0004](../lantern-rfcs/rfcs/0004-phase-0-to-phase-1-transition.md); first prototype code merged (capability/IPC core; no boot integration yet).
+**Phase:** 1 (Microkernel prototype) — open per [RFC-0004](../lantern-rfcs/rfcs/0004-phase-0-to-phase-1-transition.md); first prototype code merged and validated running under real QEMU via `lantern-boot`.
 
 ## Done
 - Kernel scope fixed to five responsibilities ([RFC-0002](../lantern-rfcs/rfcs/0002-microkernel-architecture.md), Accepted; see [ADR-0004](../lantern-rfcs/adr/0004-kernel-responsibilities-and-tcb-boundary.md)).
@@ -31,31 +31,45 @@
   delivery the receiver's `mr0` becomes the sender's endpoint badge. `CNodeInvoke`'s
   `label` values (`Mint`/`Copy`/`Move`/`Delete`/`Revoke`) are fixed in `src/cnode.rs`.
 
+## Validated under real QEMU
+[`lantern-boot`](../lantern-boot)'s two-thread demo drives a full `Call`→`Recv`→`Reply`
+round trip through real `riscv64` traps under `qemu-system-riscv64`, cold-starting the
+first thread via the new `lantern_hal::enter_first_thread`/`Hal::enter_thread` primitives
+and switching to the second via the normal trap-return path. This is the first time any
+of this crate's logic ran through `lantern-hal`'s actual trap-entry assembly rather than a
+unit test's fabricated `TrapFrame` — and it caught a real bug in that assembly (see
+`lantern-hal/STATUS.md`): the `riscv64` trampoline only ever wrote back `mr0..mr3`/the tag
+to real registers, silently discarding every context switch. Fixed there, not here — this
+crate's own logic (already covered by the `full_call_recv_reply_round_trip` unit test)
+needed no changes.
+
 ## Known Phase 1 gaps (documented in code, not silent)
 - `UntypedRetype` carves objects from a count-based budget, not real physical memory —
-  there's no memory map without `lantern-boot`.
+  `lantern-boot` doesn't parse the DTB memory map yet.
 - `TCBConfigure` cannot set a VSpace root — no HAL paging support yet
-  ([`lantern-hal`](../lantern-hal)'s remaining surface).
+  ([`lantern-hal`](../lantern-hal)'s remaining surface). The QEMU demo's two threads run
+  in the kernel's own address space at kernel privilege — no real isolation yet.
 - `Revoke` is cleanly refused (`IllegalOperation`), not implemented — needs a
   capability-derivation tree; `Delete` doesn't reclaim the underlying pooled object either
   (no refcounting yet).
 - No idle thread: a blocking operation with no other ready thread refuses with an error
   (reusing `SyscallError::Timeout`, an imperfect semantic fit) rather than stranding the
-  hart. Needs a boot-provided idle loop.
+  hart. The QEMU demo sidesteps this by construction (always ≥1 ready thread when either
+  blocks) rather than by fixing it.
 - VSpace/Frame/IRQ-handler objects don't exist yet (same HAL-paging/interrupt-controller
   dependency as `TCBConfigure`'s gap).
-- **Not yet exercised under QEMU or any real hardware** — every test runs on the host
-  against a freshly constructed `KernelState`; nothing has driven this through an actual
-  trap yet.
 
 ## Next
-- Exercise this through a real trap once `lantern-boot` exists enough to drive it.
-- VSpace/Frame objects, once `lantern-hal` has paging support.
+- VSpace/Frame objects, once `lantern-hal` has paging support — needed for actual
+  confinement, not just the IPC mechanism the QEMU demo already proves.
 - The capability-derivation tree `Revoke`/proper `Delete` reclaim need.
 - An idle thread, once `lantern-boot` can provide one.
+- `x86-64`: exercise this crate's logic there too, once `x86-64` boot work starts
+  (deferred, see `lantern-boot/STATUS.md`) — `Hal::enter_thread` is still an
+  `unimplemented!()` stub on that target.
 
 ## Blocked on
 - Nothing for further in-kernel work (CSpace/object-model/IPC refinement, VSpace object
-  shape) — but real end-to-end validation needs [`lantern-boot`](../lantern-boot)'s minimal
-  loader (itself blocked on [`lantern-crypto`](../lantern-crypto)'s implementation, not just
-  its now-ratified primitive set) and `lantern-hal` paging support.
+  shape) — the IPC core is now validated end-to-end on `riscv64`. Real confinement
+  (the "**confined** hello service" RFC-0004 calls for, vs. the mechanism-only demo running
+  today) needs `lantern-hal` paging support.

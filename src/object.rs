@@ -3,7 +3,7 @@
 //! layer): the objects a [`Capability`](crate::cap::Capability) can designate, minus
 //! `CNode` (see [`crate::cap`]).
 
-use lantern_hal::{MessageTag, TrapFrame, MR_COUNT};
+use lantern_hal::{Hal, Hardware, MessageTag, TrapFrame, MR_COUNT};
 
 use crate::cap::{CNodeId, NotificationId, SchedContextId, TcbId};
 use crate::queue::ArrayQueue;
@@ -33,6 +33,15 @@ impl SavedContext {
             mrs: [0; MR_COUNT],
             raw: [0; RAW_WORDS],
         }
+    }
+
+    /// Builds the initial saved state for a thread that has never run: `pc` where
+    /// it starts, `sp` its initial stack, `arg0` its first argument. Delegates the
+    /// actual register-layout knowledge to `lantern-hal`
+    /// ([`Hal::initial_trap_frame`]) — this stays portable, no `target_arch` logic
+    /// here, matching the HAL-seam discipline in `lantern-kernel/ARCHITECTURE.md`.
+    pub fn initial(pc: usize, sp: usize, arg0: usize) -> Self {
+        Self::save_from(&Hardware::initial_trap_frame(pc, sp, arg0))
     }
 
     /// Copies the interrupted thread's full state out of `frame`.

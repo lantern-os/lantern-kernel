@@ -28,10 +28,16 @@
 //! **Not yet implemented:** VSpace/Frame/IRQ-handler objects (need HAL paging/
 //! interrupt-controller support that doesn't exist yet), an idle thread (needs a
 //! boot-provided idle loop), and the capability-derivation tree `Revoke` needs.
-//! See `lantern-kernel/STATUS.md`. **Not yet exercised under QEMU** — every test
-//! here runs on the host against a freshly constructed [`state::KernelState`];
-//! nothing has driven this through a real trap yet, since that needs
-//! `lantern-boot` to exist.
+//! See `lantern-kernel/STATUS.md`.
+//!
+//! **Validated under real QEMU**, not just the host unit tests: `lantern-boot`'s
+//! two-thread demo drives a full `Call`→`Recv`→`Reply` round trip through
+//! [`kernel_trap_handler`]/[`enter_first_thread`] via real `riscv64` traps under
+//! `qemu-system-riscv64`. That exercise caught a real bug in `lantern-hal`'s trap
+//! trampoline (it only ever wrote back `mr0..mr3`/the tag, silently discarding
+//! every context switch) that no unit test here could have found, since these
+//! tests only ever construct a bare [`lantern_hal::TrapFrame`] directly — they
+//! never go through `lantern-hal`'s actual trap-entry assembly at all.
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_op_in_unsafe_fn)]
 
@@ -65,4 +71,35 @@ pub fn kernel_trap_handler(frame: &mut lantern_hal::TrapFrame) {
     // with itself.
     let state = unsafe { state::kernel_state() };
     syscall::dispatch(state, frame);
+}
+
+/// Cold-starts `id` as the very first thread this hart ever runs. Boot code (never
+/// `dispatch` itself — there's no trap in progress at this point) calls this
+/// exactly once, after populating `id`'s capabilities/context via
+/// [`state::kernel_state`] directly. Every thread started *after* this one needs
+/// no special handling: as long as something is already inside a real trap when a
+/// switch happens (as any second thread necessarily is, since the first thread had
+/// to trap for anything else to run), the normal trap-return path resumes it —
+/// only the very first thread has no trap in progress to piggyback on.
+///
+/// # Safety
+/// Same contract as [`lantern_hal::Hal::enter_thread`]: `id` must name a thread
+/// with a validly populated `context` (a real entry point, a real, mapped stack),
+/// and this must be the first and only call to this function on this hart.
+pub unsafe fn enter_first_thread(id: cap::TcbId) -> ! {
+    use lantern_hal::Hal;
+
+    // SAFETY: forwarded from this function's own contract — called once, before
+    // any trap, by boot code that owns exclusive access at this point.
+    let state = unsafe { state::kernel_state() };
+    state.scheduler.current = Some(id);
+    let mut frame = lantern_hal::TrapFrame::zeroed();
+    if let Some(tcb) = state.tcbs.get_mut(id.0 as usize) {
+        tcb.state = object::ThreadState::Running;
+        tcb.context.restore_into(&mut frame);
+    }
+    // SAFETY: `frame` was just populated from `id`'s own saved context; the rest
+    // of this function's contract is this function's own, forwarded from the
+    // caller.
+    unsafe { lantern_hal::Hardware::enter_thread(&frame) }
 }
