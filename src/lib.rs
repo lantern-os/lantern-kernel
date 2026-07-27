@@ -97,6 +97,7 @@ pub unsafe fn enter_first_thread(id: cap::TcbId) -> ! {
     if let Some(tcb) = state.tcbs.get_mut(id.0 as usize) {
         tcb.state = object::ThreadState::Running;
         tcb.context.restore_into(&mut frame);
+        state::activate_if_paged(tcb);
     }
     // SAFETY: `frame` was just populated from `id`'s own saved context; the rest
     // of this function's contract is this function's own, forwarded from the

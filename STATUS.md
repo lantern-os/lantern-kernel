@@ -46,9 +46,16 @@ needed no changes.
 ## Known Phase 1 gaps (documented in code, not silent)
 - `UntypedRetype` carves objects from a count-based budget, not real physical memory —
   `lantern-boot` doesn't parse the DTB memory map yet.
-- `TCBConfigure` cannot set a VSpace root — no HAL paging support yet
-  ([`lantern-hal`](../lantern-hal)'s remaining surface). The QEMU demo's two threads run
-  in the kernel's own address space at kernel privilege — no real isolation yet.
+- `TCBConfigure` still cannot set a VSpace root — there's no VSpace *capability* yet, so
+  address-space assignment isn't capability-mediated. `lantern-hal` gained real Sv39 paging
+  primitives this round (`lantern-hal/STATUS.md`) and `Tcb` gained a plain
+  `address_space: Option<usize>` field (`src/object.rs`) that `state::activate_if_paged`
+  switches to on every context switch (`unsafe { Hardware::activate_address_space(root) }`)
+  — but `lantern-boot` sets that field directly, bypassing capabilities entirely, since
+  Phase 1 has no VSpace/Frame objects to mediate it through yet. The QEMU demo's two threads
+  *do* now run under their own real Sv39 page tables in real U-mode
+  (`lantern-boot/STATUS.md`) — genuine progress toward confinement, just not yet
+  capability-driven.
 - `Revoke` is cleanly refused (`IllegalOperation`), not implemented — needs a
   capability-derivation tree; `Delete` doesn't reclaim the underlying pooled object either
   (no refcounting yet).
@@ -60,8 +67,11 @@ needed no changes.
   dependency as `TCBConfigure`'s gap).
 
 ## Next
-- VSpace/Frame objects, once `lantern-hal` has paging support — needed for actual
-  confinement, not just the IPC mechanism the QEMU demo already proves.
+- VSpace/Frame capability objects, now that `lantern-hal` has real Sv39 paging primitives to
+  build them on — needed to make address-space assignment capability-mediated instead of
+  `lantern-boot` poking `Tcb::address_space` directly, and to get real confinement (a
+  separate user program kept out of the kernel's own mappings), not just the switching
+  mechanism the QEMU demo already proves for real.
 - The capability-derivation tree `Revoke`/proper `Delete` reclaim need.
 - An idle thread, once `lantern-boot` can provide one.
 - `x86-64`: exercise this crate's logic there too, once `x86-64` boot work starts
@@ -70,6 +80,8 @@ needed no changes.
 
 ## Blocked on
 - Nothing for further in-kernel work (CSpace/object-model/IPC refinement, VSpace object
-  shape) — the IPC core is now validated end-to-end on `riscv64`. Real confinement
-  (the "**confined** hello service" RFC-0004 calls for, vs. the mechanism-only demo running
-  today) needs `lantern-hal` paging support.
+  shape) — the IPC core is now validated end-to-end on `riscv64`, including real per-thread
+  Sv39 address spaces and real U-mode execution (`lantern-boot/STATUS.md`). Real
+  confinement (a separate user program kept out of the kernel's own mappings, the last
+  piece of RFC-0004's "**confined** hello service") needs a real ELF loader, not anything
+  blocked here.

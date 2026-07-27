@@ -11,7 +11,7 @@
 
 use core::cell::UnsafeCell;
 
-use lantern_hal::TrapFrame;
+use lantern_hal::{Hal, Hardware, TrapFrame};
 
 use crate::cap::{Capability, CNode, CPtr, TcbId};
 use crate::error::SyscallError;
@@ -63,6 +63,7 @@ impl KernelState {
         if let Some(tcb) = self.tcbs.get_mut(next.0 as usize) {
             tcb.context.restore_into(frame);
             tcb.state = ThreadState::Running;
+            activate_if_paged(tcb);
         }
         self.scheduler.current = Some(next);
     }
@@ -88,6 +89,7 @@ impl KernelState {
         if let Some(tcb) = self.tcbs.get_mut(next.0 as usize) {
             tcb.context.restore_into(frame);
             tcb.state = ThreadState::Running;
+            activate_if_paged(tcb);
         }
         self.scheduler.current = Some(next);
         true
@@ -121,6 +123,21 @@ impl KernelState {
                 tcb.context = SavedContext::save_from(frame);
             }
         }
+    }
+}
+
+/// Activates `tcb`'s address space, if it has one. `None` (the default, and every
+/// thread `KernelState`'s own unit tests construct) skips the `Hal` call entirely —
+/// not even the `x86-64` no-op runs unless a thread actually has a real address
+/// space, per `Tcb::address_space`'s own doc. `pub(crate)`: also used by
+/// [`crate::enter_first_thread`], which needs the identical activate-before-entry
+/// step for the very first thread.
+pub(crate) fn activate_if_paged(tcb: &Tcb) {
+    if let Some(root) = tcb.address_space {
+        // SAFETY: `address_space`'s doc requires whoever set it (currently only
+        // `lantern-boot`, which owns physical-memory/page-table construction) to
+        // have built a valid table there.
+        unsafe { Hardware::activate_address_space(root) };
     }
 }
 

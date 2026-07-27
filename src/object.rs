@@ -127,6 +127,15 @@ pub struct Tcb {
     /// capability RFC-0005 describes ("Reply | (implicit reply cap) | Replies to
     /// the most recent unanswered Call this thread received").
     pub reply_to: Option<TcbId>,
+    /// The architecture-specific physical root page-table address for this
+    /// thread's address space (`riscv64`: an `Riscv64PageTable` built by
+    /// `lantern-hal`'s `riscv64_map_page`), or `None` for a thread that hasn't
+    /// been given one — not yet capability-mediated (no VSpace object exists in
+    /// `lantern-kernel` yet, see `STATUS.md`); `lantern-boot` sets this directly.
+    /// `None` also keeps every existing host unit test working unmodified: with
+    /// no address space, a switch never calls `Hal::activate_address_space` at
+    /// all, not even the `x86-64` no-op.
+    pub address_space: Option<usize>,
 }
 
 impl Tcb {
@@ -137,6 +146,7 @@ impl Tcb {
             sched_context: None,
             context: SavedContext::zeroed(),
             reply_to: None,
+            address_space: None,
         }
     }
 }
