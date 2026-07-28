@@ -1,6 +1,6 @@
 # lantern-kernel — Status
 
-**Phase:** 1 (Microkernel prototype) — open per [RFC-0004](../lantern-rfcs/rfcs/0004-phase-0-to-phase-1-transition.md); first prototype code merged and validated running under real QEMU via `lantern-boot`.
+**Phase:** 1 (Microkernel prototype) — open per [RFC-0004](../lantern-rfcs/rfcs/0004-phase-0-to-phase-1-transition.md); RFC-0004's exit criterion (a confined "hello service" reachable only via a granted capability) is met, validated running under real QEMU via `lantern-boot`'s ELF loader.
 
 ## Done
 - Kernel scope fixed to five responsibilities ([RFC-0002](../lantern-rfcs/rfcs/0002-microkernel-architecture.md), Accepted; see [ADR-0004](../lantern-rfcs/adr/0004-kernel-responsibilities-and-tcb-boundary.md)).
@@ -30,32 +30,38 @@
   `src/abi.rs`: the invoked capability's CPtr is `mr0` (payload is `mr1..mr3`), and on
   delivery the receiver's `mr0` becomes the sender's endpoint badge. `CNodeInvoke`'s
   `label` values (`Mint`/`Copy`/`Move`/`Delete`/`Revoke`) are fixed in `src/cnode.rs`.
+- **VSpace/Frame capability objects and `FrameInvoke`** ([RFC-0008](../lantern-rfcs/rfcs/0008-vspace-frame-capabilities-and-elf-loader.md)/
+  [ADR-0012](../lantern-rfcs/adr/0012-vspace-frame-capabilities-and-elf-loader.md)) — the
+  syscall table's 13th entry, resolving the "VSpace/Frame invocation label tables" RFC-0005
+  explicitly deferred. `Frame` has an explicit size class (`FrameSize::Small`/`Mega`; `Mega`
+  is what `lantern-boot` actually uses, exclusively, per `lantern-hal/STATUS.md`'s QEMU
+  workaround). `Untyped` gained an *optional* real physical bump range
+  (`Untyped::bump`/`with_memory`) — count-based budgeting (`remaining`) is unchanged and
+  still governs every object type, but `VSpace`/`Frame*` retype additionally needs (and
+  consumes) real memory, since unlike `CNode`/`Endpoint`/etc. they *name* physical pages
+  rather than just occupying a kernel pool slot. `TCBConfigure` gained a fourth, optional
+  argument (a VSpace capability) — retiring the direct `Tcb.address_space` field poke
+  `lantern-boot`'s old demo used. 41 unit tests pass (13 new, including memory-backed-Untyped
+  `Map`/`Unmap` tests that genuinely dereference real host buffers, the same technique
+  `lantern-hal/riscv64_paging.rs`'s own tests use), `cargo clippy -D warnings` clean on host
+  and `riscv64gc-unknown-none-elf`.
 
 ## Validated under real QEMU
-[`lantern-boot`](../lantern-boot)'s two-thread demo drives a full `Call`→`Recv`→`Reply`
-round trip through real `riscv64` traps under `qemu-system-riscv64`, cold-starting the
-first thread via the new `lantern_hal::enter_first_thread`/`Hal::enter_thread` primitives
-and switching to the second via the normal trap-return path. This is the first time any
-of this crate's logic ran through `lantern-hal`'s actual trap-entry assembly rather than a
-unit test's fabricated `TrapFrame` — and it caught a real bug in that assembly (see
-`lantern-hal/STATUS.md`): the `riscv64` trampoline only ever wrote back `mr0..mr3`/the tag
-to real registers, silently discarding every context switch. Fixed there, not here — this
-crate's own logic (already covered by the `full_call_recv_reply_round_trip` unit test)
-needed no changes.
+[`lantern-boot`](../lantern-boot)'s loader (`src/loader.rs`, RFC-0008) drives a full
+`Call`→`Recv`→`Reply` round trip through real `riscv64` traps under `qemu-system-riscv64`,
+between two independently-built, separately-loaded programs, each running under its own
+real VSpace built via this crate's real `admin::untyped_retype`/`frame::invoke` functions
+— not a fabricated `TrapFrame`, and not (any more) a direct-field-poke shortcut either. This
+is also where `lantern-hal`'s `riscv64` trap trampoline bug was originally caught (see
+`lantern-hal/STATUS.md`): the trampoline only ever wrote back `mr0..mr3`/the tag to real
+registers, silently discarding every context switch. Fixed there, not here — this crate's
+own logic (covered by the `full_call_recv_reply_round_trip` unit test) needed no changes.
 
 ## Known Phase 1 gaps (documented in code, not silent)
-- `UntypedRetype` carves objects from a count-based budget, not real physical memory —
-  `lantern-boot` doesn't parse the DTB memory map yet.
-- `TCBConfigure` still cannot set a VSpace root — there's no VSpace *capability* yet, so
-  address-space assignment isn't capability-mediated. `lantern-hal` gained real Sv39 paging
-  primitives this round (`lantern-hal/STATUS.md`) and `Tcb` gained a plain
-  `address_space: Option<usize>` field (`src/object.rs`) that `state::activate_if_paged`
-  switches to on every context switch (`unsafe { Hardware::activate_address_space(root) }`)
-  — but `lantern-boot` sets that field directly, bypassing capabilities entirely, since
-  Phase 1 has no VSpace/Frame objects to mediate it through yet. The QEMU demo's two threads
-  *do* now run under their own real Sv39 page tables in real U-mode
-  (`lantern-boot/STATUS.md`) — genuine progress toward confinement, just not yet
-  capability-driven.
+- `Untyped`'s count-based budget (`remaining`) still isn't backed by a *general* physical
+  memory map — `lantern-boot` doesn't parse the DTB yet. `VSpace`/`Frame*` retype now *does*
+  consume real memory (see "Done" above), but from a single hardcoded range
+  `lantern-boot/pmm.rs` seeds at boot, not real discovery.
 - `Revoke` is cleanly refused (`IllegalOperation`), not implemented — needs a
   capability-derivation tree; `Delete` doesn't reclaim the underlying pooled object either
   (no refcounting yet).
@@ -63,25 +69,24 @@ needed no changes.
   (reusing `SyscallError::Timeout`, an imperfect semantic fit) rather than stranding the
   hart. The QEMU demo sidesteps this by construction (always ≥1 ready thread when either
   blocks) rather than by fixing it.
-- VSpace/Frame/IRQ-handler objects don't exist yet (same HAL-paging/interrupt-controller
-  dependency as `TCBConfigure`'s gap).
+- IRQ-handler objects don't exist yet (interrupt-controller HAL support is a separate,
+  unstarted dependency — `lantern-hal/STATUS.md`).
+- `cnode::invoke`'s `Copy`/`Move` only operate on slots *within a single CNode* — there's no
+  cross-CNode capability-transfer primitive yet, so `lantern-boot/loader.rs` still places
+  the one capability each loaded program needs (the shared endpoint) via a direct pool
+  write rather than a real invocation. Pre-existing gap, not new from RFC-0008.
 
 ## Next
-- VSpace/Frame capability objects, now that `lantern-hal` has real Sv39 paging primitives to
-  build them on — needed to make address-space assignment capability-mediated instead of
-  `lantern-boot` poking `Tcb::address_space` directly, and to get real confinement (a
-  separate user program kept out of the kernel's own mappings), not just the switching
-  mechanism the QEMU demo already proves for real.
 - The capability-derivation tree `Revoke`/proper `Delete` reclaim need.
 - An idle thread, once `lantern-boot` can provide one.
+- A cross-CNode capability-transfer primitive, to close the one remaining direct-pool-write
+  gap `loader.rs` still has.
 - `x86-64`: exercise this crate's logic there too, once `x86-64` boot work starts
   (deferred, see `lantern-boot/STATUS.md`) — `Hal::enter_thread` is still an
   `unimplemented!()` stub on that target.
 
 ## Blocked on
-- Nothing for further in-kernel work (CSpace/object-model/IPC refinement, VSpace object
-  shape) — the IPC core is now validated end-to-end on `riscv64`, including real per-thread
-  Sv39 address spaces and real U-mode execution (`lantern-boot/STATUS.md`). Real
-  confinement (a separate user program kept out of the kernel's own mappings, the last
-  piece of RFC-0004's "**confined** hello service") needs a real ELF loader, not anything
-  blocked here.
+- Nothing for further in-kernel work (CSpace/object-model/IPC refinement) — the IPC core is
+  now validated end-to-end on `riscv64`, including real per-program Sv39 address spaces
+  built through real capability invocations and real U-mode execution
+  (`lantern-boot/STATUS.md`). RFC-0004's "**confined** hello service" exit criterion is met.

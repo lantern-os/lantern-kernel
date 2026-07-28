@@ -24,6 +24,8 @@ define_id!(EndpointId);
 define_id!(NotificationId);
 define_id!(UntypedId);
 define_id!(SchedContextId);
+define_id!(VSpaceId);
+define_id!(FrameId);
 
 /// Rights are a bitset over a fixed, small lattice ([RFC-0003](../../lantern-rfcs/rfcs/0003-capability-model.md)
 /// leaves the exact lattice per object type as an open question — this is Phase 1's
@@ -75,6 +77,21 @@ pub enum ObjectType {
     Notification,
     Tcb,
     SchedContext,
+    /// An address space (an Sv39 root page table) — [RFC-0008](../../lantern-rfcs/rfcs/0008-vspace-frame-capabilities-and-elf-loader.md)/
+    /// [ADR-0012](../../lantern-rfcs/adr/0012-vspace-frame-capabilities-and-elf-loader.md).
+    /// Retyping one requires the source Untyped to carry real physical memory
+    /// (`crate::object::Untyped::memory`) — see `admin::untyped_retype`.
+    VSpace,
+    /// A 4 KiB physical page, retyped for mapping via [`crate::frame`]'s
+    /// `FrameInvoke`. Same real-memory requirement as `VSpace`. Correct and
+    /// host-tested, but not what Phase 1's loader actually uses yet — see
+    /// `FrameMega`'s doc.
+    FrameSmall,
+    /// A 2 MiB physical page ([`lantern_hal::RISCV64_MEGAPAGE_SIZE`]) — what
+    /// Phase 1's `lantern-boot` loader uses exclusively, a documented workaround
+    /// for a QEMU-environment limitation with full 3-level Sv39 walks
+    /// (`lantern-hal/STATUS.md`), not a property of this object model itself.
+    FrameMega,
 }
 
 impl ObjectType {
@@ -88,6 +105,9 @@ impl ObjectType {
             3 => ObjectType::Notification,
             4 => ObjectType::Tcb,
             5 => ObjectType::SchedContext,
+            6 => ObjectType::VSpace,
+            7 => ObjectType::FrameSmall,
+            8 => ObjectType::FrameMega,
             _ => return None,
         })
     }
@@ -115,6 +135,13 @@ pub enum Capability {
     /// call — see `lantern-kernel/STATUS.md`'s open question on whether reply caps
     /// become first-class grantable objects (RFC-0005, deferred to Phase 2).
     Reply { tcb: TcbId },
+    /// An address space — [RFC-0008](../../lantern-rfcs/rfcs/0008-vspace-frame-capabilities-and-elf-loader.md).
+    VSpace { id: VSpaceId, rights: Rights },
+    /// A physical page usable as a `FrameInvoke` mapping target — RFC-0008. `size`
+    /// is fixed at retype time (`ObjectType::FrameSmall`/`FrameMega`), not this
+    /// capability's own field, since it's a property of the underlying
+    /// [`crate::object::Frame`], not something a capability copy/mint could change.
+    Frame { id: FrameId, rights: Rights },
 }
 
 impl Capability {
@@ -127,6 +154,14 @@ impl Capability {
             Capability::Notification { .. } => Some(ObjectType::Notification),
             Capability::Tcb { .. } => Some(ObjectType::Tcb),
             Capability::SchedContext { .. } => Some(ObjectType::SchedContext),
+            // Approximate: both `FrameSmall`/`FrameMega` retype into the same
+            // `Capability::Frame` shape, so which one can't be recovered from the
+            // capability alone — the real size lives on the pooled `Frame` object
+            // itself (`crate::object::Frame::size`). Nothing currently calls
+            // `object_type()` for a `Frame` capability; if something needs the
+            // exact size, look up the pooled object instead of trusting this.
+            Capability::Frame { .. } => Some(ObjectType::FrameMega),
+            Capability::VSpace { .. } => Some(ObjectType::VSpace),
         }
     }
 
@@ -137,7 +172,9 @@ impl Capability {
             | Capability::Endpoint { rights, .. }
             | Capability::Notification { rights, .. }
             | Capability::Tcb { rights, .. }
-            | Capability::SchedContext { rights, .. } => *rights,
+            | Capability::SchedContext { rights, .. }
+            | Capability::VSpace { rights, .. }
+            | Capability::Frame { rights, .. } => *rights,
         }
     }
 }

@@ -16,9 +16,12 @@ use lantern_hal::{Hal, Hardware, TrapFrame};
 use crate::cap::{Capability, CNode, CPtr, TcbId};
 use crate::error::SyscallError;
 use crate::limits::{
-    MAX_CNODES, MAX_ENDPOINTS, MAX_NOTIFICATIONS, MAX_SCHED_CONTEXTS, MAX_TCBS, MAX_UNTYPEDS,
+    MAX_CNODES, MAX_ENDPOINTS, MAX_FRAMES, MAX_NOTIFICATIONS, MAX_SCHED_CONTEXTS, MAX_TCBS,
+    MAX_UNTYPEDS, MAX_VSPACES,
 };
-use crate::object::{Endpoint, Notification, SavedContext, SchedulingContext, Tcb, ThreadState, Untyped};
+use crate::object::{
+    Endpoint, Frame, Notification, SavedContext, SchedulingContext, Tcb, ThreadState, Untyped, VSpace,
+};
 use crate::pool::Pool;
 use crate::scheduler::Scheduler;
 
@@ -29,6 +32,10 @@ pub struct KernelState {
     pub notifications: Pool<Notification, MAX_NOTIFICATIONS>,
     pub untypeds: Pool<Untyped, MAX_UNTYPEDS>,
     pub sched_contexts: Pool<SchedulingContext, MAX_SCHED_CONTEXTS>,
+    /// RFC-0008/ADR-0012.
+    pub vspaces: Pool<VSpace, MAX_VSPACES>,
+    /// RFC-0008/ADR-0012.
+    pub frames: Pool<Frame, MAX_FRAMES>,
     pub scheduler: Scheduler,
 }
 
@@ -41,6 +48,8 @@ impl KernelState {
             notifications: Pool::new(),
             untypeds: Pool::new(),
             sched_contexts: Pool::new(),
+            vspaces: Pool::new(),
+            frames: Pool::new(),
             scheduler: Scheduler::new(),
         }
     }

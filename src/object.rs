@@ -5,7 +5,7 @@
 
 use lantern_hal::{Hal, Hardware, MessageTag, TrapFrame, MR_COUNT};
 
-use crate::cap::{CNodeId, NotificationId, SchedContextId, TcbId};
+use crate::cap::{CNodeId, NotificationId, SchedContextId, TcbId, UntypedId, VSpaceId};
 use crate::queue::ArrayQueue;
 
 /// Must match [`lantern_hal`]'s `TrapFrame::raw` word count. Not exported as a
@@ -209,21 +209,105 @@ impl Default for Notification {
 /// Untyped memory, ready to be `UntypedRetype`d into typed objects.
 ///
 /// **Phase 1 simplification:** real (seL4/ADR-0008) Untyped is byte-granular
-/// physical memory; there is no physical memory map to carve from yet (no
-/// `lantern-boot`). This models Untyped as an object-count *budget* instead —
-/// `remaining` decrements by one per object retyped, regardless of the target
-/// object's real size. This is enough to exercise the retype mechanism and its
-/// capability bookkeeping end to end; it is not yet backed by real memory
-/// accounting, tracked in `lantern-kernel/STATUS.md`.
+/// physical memory; there is no general physical memory map to carve from yet
+/// (no DTB parsing — `lantern-kernel/STATUS.md`). This models Untyped as an
+/// object-count *budget* first and foremost — `remaining` decrements by one per
+/// object retyped, regardless of the target object's real size — which is
+/// enough to exercise the retype mechanism and its capability bookkeeping end to
+/// end for `CNode`/`Endpoint`/`Notification`/`Tcb`/`SchedContext`, none of which
+/// need a real physical address (they live in the kernel's own pools, not
+/// user-addressable memory).
+///
+/// **`VSpace`/`Frame` are different: they *name* real physical memory** (an Sv39
+/// root page table; a page a thread can map), so retyping one needs an actual
+/// address, not just a decremented count. `memory`, when `Some`, is a real
+/// physical bump range `lantern-boot` seeds at boot from its own `pmm` allocator
+/// (the only real physical-memory source that exists today) — see
+/// [RFC-0008](../../lantern-rfcs/rfcs/0008-vspace-frame-capabilities-and-elf-loader.md)/
+/// [ADR-0012](../../lantern-rfcs/adr/0012-vspace-frame-capabilities-and-elf-loader.md).
+/// This is a narrow, additive change to *specific* Untyped instances, not a
+/// general physical-memory-discovery subsystem — most Untypeds (e.g. the ones
+/// today's tests construct) still have `memory: None` and can retype anything
+/// except `VSpace`/`Frame*`.
 #[derive(Clone, Copy, Debug)]
 pub struct Untyped {
     pub remaining: usize,
+    memory: Option<(usize, usize)>,
 }
 
 impl Untyped {
     pub const fn new(budget: usize) -> Self {
-        Self { remaining: budget }
+        Self { remaining: budget, memory: None }
     }
+
+    /// A budget additionally backed by a real physical range `[base, base + len)`
+    /// — see this struct's doc. `lantern-boot` is the only expected caller.
+    pub const fn with_memory(budget: usize, base: usize, len: usize) -> Self {
+        Self { remaining: budget, memory: Some((base, base + len)) }
+    }
+
+    /// Bump-allocates one `size`-byte, `align`-aligned chunk of real physical
+    /// memory from this Untyped's backing range, or `None` if it has no such
+    /// range (a plain count-only budget) or the range is exhausted. Does *not*
+    /// touch `remaining` — callers (`admin::untyped_retype`) decrement that
+    /// separately, the same one-per-object accounting every other retyped type
+    /// already uses.
+    pub fn bump(&mut self, size: usize, align: usize) -> Option<usize> {
+        let (next, end) = self.memory?;
+        let aligned = (next + align - 1) & !(align - 1);
+        let new_next = aligned.checked_add(size)?;
+        if new_next > end {
+            return None;
+        }
+        self.memory = Some((new_next, end));
+        Some(aligned)
+    }
+}
+
+/// The Sv39 leaf sizes [`Frame`] supports (RFC-0008/ADR-0012). `Mega` is what
+/// `lantern-boot`'s loader actually uses, exclusively, for now — a documented
+/// workaround for a QEMU-environment limitation with full 3-level Sv39 walks
+/// (`lantern-hal/STATUS.md`), not a property of this object model. `Small` is
+/// fully specified so switching back is a one-line change once that's resolved.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FrameSize {
+    Small,
+    Mega,
+}
+
+impl FrameSize {
+    pub const fn bytes(self) -> usize {
+        match self {
+            FrameSize::Small => lantern_hal::RISCV64_PAGE_SIZE,
+            FrameSize::Mega => lantern_hal::RISCV64_MEGAPAGE_SIZE,
+        }
+    }
+}
+
+/// An address space: one Sv39 root page table. `root` is a real physical
+/// address, from the owning Untyped's `memory` range (RFC-0008/ADR-0012).
+#[derive(Clone, Copy, Debug)]
+pub struct VSpace {
+    pub root: usize,
+    /// Which Untyped this VSpace's root table (and any L1 tables `FrameInvoke`
+    /// `Map` needs to create on demand) were bump-allocated from — `Map` reuses
+    /// it rather than taking a separate "which Untyped to allocate from"
+    /// argument every caller would otherwise have to supply.
+    pub(crate) source: UntypedId,
+}
+
+/// One physical page usable as a `FrameInvoke` mapping target — RFC-0008/
+/// ADR-0012. `paddr` is real physical memory, from the owning Untyped's
+/// `memory` range, sized per `size`.
+#[derive(Clone, Copy, Debug)]
+pub struct Frame {
+    pub paddr: usize,
+    pub size: FrameSize,
+    /// Which VSpace currently maps this Frame, and at what address — `Unmap`'s
+    /// target, and what stops a Frame being mapped into two VSpaces (or twice
+    /// into the same one) at once. Phase 1 has no shared-frame IPC yet, so a
+    /// Frame has at most one mapping, full stop.
+    pub mapped_at: Option<(VSpaceId, usize)>,
 }
 
 /// Phase 1 scheduling context ([ADR-0009](../../lantern-rfcs/adr/0009-phase1-scheduling-context-model.md)):

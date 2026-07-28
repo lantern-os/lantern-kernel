@@ -46,6 +46,7 @@ pub mod admin;
 pub mod cap;
 pub mod cnode;
 pub mod error;
+pub mod frame;
 pub mod ipc;
 pub mod limits;
 pub mod object;

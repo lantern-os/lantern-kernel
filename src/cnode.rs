@@ -59,8 +59,8 @@ pub fn invoke(
 
 /// `packed = (badge << 8) | rights_bits` — Mint needs two arguments (new rights,
 /// new badge) but only has one payload word (`mr3`) free, so this convention packs
-/// both into it. `rights`-only capability types (CNode/Tcb/Untyped/SchedContext)
-/// simply ignore the badge bits.
+/// both into it. `rights`-only capability types (CNode/Tcb/Untyped/SchedContext/
+/// VSpace/Frame) simply ignore the badge bits.
 fn mint(
     state: &mut KernelState,
     target: CNodeId,
@@ -97,6 +97,8 @@ fn attenuate(source: Capability, rights: Rights, badge: u64) -> Result<Capabilit
         Capability::Notification { id, .. } => Capability::Notification { id, badge, rights },
         Capability::Tcb { id, .. } => Capability::Tcb { id, rights },
         Capability::SchedContext { id, .. } => Capability::SchedContext { id, rights },
+        Capability::VSpace { id, .. } => Capability::VSpace { id, rights },
+        Capability::Frame { id, .. } => Capability::Frame { id, rights },
         Capability::CNode(_) | Capability::Null | Capability::Reply { .. } => {
             return Err(SyscallError::IllegalOperation);
         }

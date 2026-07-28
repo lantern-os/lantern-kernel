@@ -1,9 +1,11 @@
-//! The syscall table ([ADR-0008](../../lantern-rfcs/adr/0008-kernel-syscall-ipc-abi.md)'s
-//! 12 entries) and [`dispatch`], the real entry point: takes a fresh
-//! [`KernelState`] (or, at the real trap boundary, the global one via
-//! [`crate::kernel_trap_handler`]) and a live [`TrapFrame`], and does the syscall.
-//! Kept separate from [`crate::kernel_state`]'s one `unsafe` cell access precisely
-//! so this — the actual logic — stays unit testable with an isolated state.
+//! The syscall table (ADR-0008's 12 entries, plus `FrameInvoke` added by
+//! [RFC-0008](../../lantern-rfcs/rfcs/0008-vspace-frame-capabilities-and-elf-loader.md)/
+//! [ADR-0012](../../lantern-rfcs/adr/0012-vspace-frame-capabilities-and-elf-loader.md))
+//! and [`dispatch`], the real entry point: takes a fresh [`KernelState`] (or, at
+//! the real trap boundary, the global one via [`crate::kernel_trap_handler`]) and
+//! a live [`TrapFrame`], and does the syscall. Kept separate from
+//! [`crate::kernel_state`]'s one `unsafe` cell access precisely so this — the
+//! actual logic — stays unit testable with an isolated state.
 
 use lantern_hal::TrapFrame;
 
@@ -27,6 +29,9 @@ pub enum SyscallNumber {
     UntypedRetype = 10,
     TCBConfigure = 11,
     Yield = 12,
+    /// `Map`/`Unmap` — [RFC-0008](../../lantern-rfcs/rfcs/0008-vspace-frame-capabilities-and-elf-loader.md)/
+    /// [ADR-0012](../../lantern-rfcs/adr/0012-vspace-frame-capabilities-and-elf-loader.md).
+    FrameInvoke = 13,
 }
 
 impl SyscallNumber {
@@ -44,6 +49,7 @@ impl SyscallNumber {
             10 => Self::UntypedRetype,
             11 => Self::TCBConfigure,
             12 => Self::Yield,
+            13 => Self::FrameInvoke,
             _ => return None,
         })
     }
@@ -93,6 +99,9 @@ pub fn dispatch(state: &mut KernelState, frame: &mut TrapFrame) {
         SyscallNumber::CNodeInvoke => cnode::invoke(state, current, cptr, frame),
         SyscallNumber::UntypedRetype => admin::untyped_retype(state, current, cptr, frame),
         SyscallNumber::TCBConfigure => admin::configure(state, current, cptr, frame),
+        // `crate::frame`, fully qualified: `dispatch`'s own `frame: &mut TrapFrame`
+        // parameter would otherwise shadow the module name.
+        SyscallNumber::FrameInvoke => crate::frame::invoke(state, current, cptr, frame),
         SyscallNumber::Yield => {
             yield_now(state, current, frame);
             Ok(())
