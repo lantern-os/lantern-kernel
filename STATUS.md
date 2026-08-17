@@ -1,6 +1,6 @@
 # lantern-kernel — Status
 
-**Phase:** 1 (Microkernel prototype) — open per [RFC-0004](../lantern-rfcs/rfcs/0004-phase-0-to-phase-1-transition.md); RFC-0004's exit criterion (a confined "hello service" reachable only via a granted capability) is met, validated running under real QEMU via `lantern-boot`'s ELF loader.
+**Phase:** 1 (Microkernel prototype) — open per [RFC-0004](../lantern-rfcs/rfcs/0004-phase-0-to-phase-1-transition.md). **RFC-0004's exit criterion is now fully met**: a confined "hello service" reachable only via a granted capability, validated under real QEMU via `lantern-boot`'s ELF loader, with IPC latency benchmarked ([ADR-0013](../lantern-rfcs/adr/0013-ipc-latency-benchmark.md), `lantern-boot/STATUS.md`).
 
 ## Done
 - Kernel scope fixed to five responsibilities ([RFC-0002](../lantern-rfcs/rfcs/0002-microkernel-architecture.md), Accepted; see [ADR-0004](../lantern-rfcs/adr/0004-kernel-responsibilities-and-tcb-boundary.md)).
@@ -45,6 +45,9 @@
   `Map`/`Unmap` tests that genuinely dereference real host buffers, the same technique
   `lantern-hal/riscv64_paging.rs`'s own tests use), `cargo clippy -D warnings` clean on host
   and `riscv64gc-unknown-none-elf`.
+- Added `two_call_reply_round_trips_in_a_row_client_runs_first`, a host-side reproduction of
+  the real QEMU IPC round-trip-loss bug's dispatch sequence (see "Known Phase 1 gaps" below)
+  — it passes, ruling out this crate's own dispatch logic as the cause. 42 unit tests pass.
 
 ## Validated under real QEMU
 [`lantern-boot`](../lantern-boot)'s loader (`src/loader.rs`, RFC-0008) drives a full
@@ -75,6 +78,17 @@ own logic (covered by the `full_call_recv_reply_round_trip` unit test) needed no
   cross-CNode capability-transfer primitive yet, so `lantern-boot/loader.rs` still places
   the one capability each loaded program needs (the shared endpoint) via a direct pool
   write rather than a real invocation. Pre-existing gap, not new from RFC-0008.
+- **IPC round-trip loss under real QEMU, not reproducible on host.** Found while building
+  `lantern-boot`'s IPC benchmark: the first `Call`/`block_current` a thread issues right
+  after a warm-up round trip occasionally never actually resumes the receiver, despite
+  `block_current` returning `true` and `scheduler.current` being set correctly — see
+  `lantern-boot/STATUS.md`'s "IPC round-trip loss" entry for the full investigation.
+  `syscall::tests::two_call_reply_round_trips_in_a_row_client_runs_first` reproduces the
+  identical dispatch sequence against portable `KernelState` (no real paging) and passes,
+  which is evidence this crate's own `ipc::call`/`block_current` logic is *not* the cause —
+  the bug lives somewhere in the real trap-entry/exit or address-space-switch path this
+  crate's host tests structurally cannot exercise. Not root-caused; worked around at the
+  `lantern-boot` call site with extra tolerated round trips, not fixed here.
 
 ## Next
 - The capability-derivation tree `Revoke`/proper `Delete` reclaim need.

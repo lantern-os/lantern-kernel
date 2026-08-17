@@ -169,6 +169,71 @@ mod tests {
         assert!(!frame.tag().is_error());
     }
 
+    /// Regression coverage for the IPC benchmark work (`lantern-boot`): under
+    /// real QEMU/riscv64, the *first* repeated `Call`/`Reply` round trip after
+    /// a warm-up one occasionally drops a message — `block_current` reports
+    /// `switched: true` and `scheduler.current` genuinely becomes the server,
+    /// yet execution somehow resumes the client anyway (see
+    /// `lantern-boot/STATUS.md`'s "IPC round-trip loss" entry for the full
+    /// investigation). This test reproduces the identical dispatch sequence
+    /// against portable state only (no real paging/HAL) and passes cleanly,
+    /// which is evidence *against* the pure kernel-logic explanation — the bug
+    /// is somewhere in the real trap-entry/exit or address-space-switch
+    /// machinery this test can't exercise, not in `ipc::call`/`block_current`
+    /// themselves.
+    #[test]
+    fn two_call_reply_round_trips_in_a_row_client_runs_first() {
+        let mut state = KernelState::new();
+        let ep_idx = state.endpoints.alloc(crate::object::Endpoint::new()).unwrap();
+        let ep = Capability::Endpoint { id: EndpointId(ep_idx as u16), badge: 42, rights: Rights::ALL };
+
+        let client_cnode = CNodeId(state.cnodes.alloc(CNode::empty()).unwrap() as u16);
+        *state.cnodes.get_mut(client_cnode.0 as usize).unwrap().slot_mut(1).unwrap() = ep;
+        let client = TcbId(state.tcbs.alloc(Tcb::new()).unwrap() as u16);
+        state.tcbs.get_mut(client.0 as usize).unwrap().cspace = Some(client_cnode);
+
+        let server_cnode = CNodeId(state.cnodes.alloc(CNode::empty()).unwrap() as u16);
+        *state.cnodes.get_mut(server_cnode.0 as usize).unwrap().slot_mut(1).unwrap() = ep;
+        let server = TcbId(state.tcbs.alloc(Tcb::new()).unwrap() as u16);
+        state.tcbs.get_mut(server.0 as usize).unwrap().cspace = Some(server_cnode);
+
+        // Matches the real `lantern-boot` demo's actual order: server made
+        // ready but *client* runs first (`enter_first_thread`).
+        state.make_ready(server);
+        state.scheduler.current = Some(client);
+
+        for i in 0..3u32 {
+            // Client calls; server hasn't reached Recv yet, so this blocks and
+            // switches to server via `block_current`.
+            let mut frame = TrapFrame::zeroed();
+            frame.set_syscall_number(SyscallNumber::Call as usize);
+            frame.set_mr(0, 1);
+            frame.set_mr(1, 111 + i as usize);
+            dispatch(&mut state, &mut frame);
+            assert_eq!(
+                state.scheduler.current,
+                Some(server),
+                "iteration {i}: call should have switched to server (has_ready was true)"
+            );
+            assert!(!frame.tag().is_error(), "iteration {i}: call errored: mr0={:#x}", frame.mr(0));
+
+            // Server receives.
+            let mut frame = TrapFrame::zeroed();
+            frame.set_syscall_number(SyscallNumber::Recv as usize);
+            frame.set_mr(0, 1);
+            dispatch(&mut state, &mut frame);
+            assert_eq!(frame.mr(1), 111 + i as usize, "iteration {i}: payload delivered");
+
+            // Server replies.
+            let mut frame = TrapFrame::zeroed();
+            frame.set_syscall_number(SyscallNumber::Reply as usize);
+            frame.set_mr(1, 222 + i as usize);
+            dispatch(&mut state, &mut frame);
+            assert_eq!(state.scheduler.current, Some(client), "iteration {i}: reply should switch back to client");
+            assert_eq!(frame.mr(1), 222 + i as usize, "iteration {i}: client sees the reply payload");
+        }
+    }
+
     #[test]
     fn unknown_syscall_number_returns_a_defined_error_not_a_panic() {
         let mut state = KernelState::new();
