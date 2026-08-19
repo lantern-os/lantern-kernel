@@ -18,6 +18,19 @@ impl<T: Copy, const N: usize> ArrayQueue<T, N> {
         self.len == 0
     }
 
+    /// The head element, if any, without removing it — lets a caller validate
+    /// something about the front of the queue before committing to `pop_front`
+    /// (RFC-0010's capability-transfer path needs this: check the receiver has a
+    /// valid destination slot *before* dequeuing it, so a failed transfer leaves
+    /// the queue untouched rather than losing an entry).
+    pub fn front(&self) -> Option<T> {
+        if self.len == 0 {
+            None
+        } else {
+            self.items[self.head]
+        }
+    }
+
     pub fn push_back(&mut self, value: T) -> bool {
         if self.len >= N {
             return false;
@@ -63,6 +76,18 @@ mod tests {
         assert_eq!(q.pop_front(), Some(4));
         assert_eq!(q.pop_front(), None);
         assert!(q.is_empty());
+    }
+
+    #[test]
+    fn front_peeks_without_removing() {
+        let mut q: ArrayQueue<u32, 4> = ArrayQueue::new();
+        assert_eq!(q.front(), None);
+        q.push_back(1);
+        q.push_back(2);
+        assert_eq!(q.front(), Some(1));
+        assert_eq!(q.front(), Some(1), "front does not mutate the queue");
+        assert_eq!(q.pop_front(), Some(1));
+        assert_eq!(q.front(), Some(2));
     }
 
     #[test]

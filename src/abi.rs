@@ -14,10 +14,17 @@
 //!   unforgeable caller identifier ADR-0006 describes ("badged so a service can
 //!   distinguish callers without trusting their self-asserted identity"). `mr1..3`
 //!   carry the sender's payload through unchanged.
-//! - **The IPC buffer (extended message words, capability transfer) is not
-//!   implemented.** Any message claiming `tag.length > 0` or `tag.extra_caps > 0`
-//!   is rejected with `TruncatedMessage` rather than silently dropping the extra
-//!   words — Phase 1's fast path is register-only.
+//! - **The IPC buffer (extended message words) is not implemented.** Any message
+//!   claiming `tag.length > 0` is rejected with `TruncatedMessage` rather than
+//!   silently dropping the extra words — Phase 1's fast path is register-only.
+//! - **Single-capability transfer (`tag.extra_caps == 1`) is implemented** ([RFC-0010](../../lantern-rfcs/rfcs/0010-cross-process-capability-transfer-and-brokering.md)),
+//!   in [`crate::ipc`]: `Send`/`Call` treat `mr1` as the sender's CPtr for the
+//!   capability being transferred (payload shrinks to `mr2`/`mr3`), and `Recv`
+//!   treats its own `mr1` as the receiver's destination CPtr. `tag.extra_caps > 1`
+//!   still has nowhere to go (no in-memory IPC buffer exists) and is rejected the
+//!   same way `length > 0` is. `Reply`'s return leg does not support a transfer
+//!   yet — RFC-0010 left its exact register layout as an open question — and
+//!   still rejects any nonzero `extra_caps`.
 
 use lantern_hal::{MessageTag, TrapFrame, FLAG_ERROR};
 
@@ -36,9 +43,23 @@ pub fn reply_error(frame: &mut TrapFrame, error: SyscallError) {
     frame.set_tag(tag);
 }
 
-/// `Err` if `tag` claims more than the register-only fast path can carry (see the
-/// module doc's "IPC buffer... not implemented" note).
+/// `Err` if `tag` claims more than `Send`/`Call`/`Recv`'s register-only fast path
+/// (plus the single-capability-transfer slot RFC-0010 adds) can carry: extended
+/// message words (`length > 0`), or more than one attached capability
+/// (`extra_caps > 1`) — see the module doc.
 pub fn require_fast_path_only(tag: MessageTag) -> Result<(), SyscallError> {
+    if tag.length > 0 || tag.extra_caps > 1 {
+        Err(SyscallError::TruncatedMessage)
+    } else {
+        Ok(())
+    }
+}
+
+/// `Reply`'s stricter check: its return leg doesn't support capability transfer
+/// yet (RFC-0010 left the register layout for it unresolved), so unlike
+/// `require_fast_path_only`, *any* nonzero `extra_caps` is rejected here, not
+/// just `> 1`.
+pub fn require_no_extra_caps(tag: MessageTag) -> Result<(), SyscallError> {
     if tag.length > 0 || tag.extra_caps > 0 {
         Err(SyscallError::TruncatedMessage)
     } else {

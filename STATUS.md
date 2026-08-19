@@ -48,6 +48,25 @@
 - Added `two_call_reply_round_trips_in_a_row_client_runs_first`, a host-side reproduction of
   the real QEMU IPC round-trip-loss bug's dispatch sequence (see "Known Phase 1 gaps" below)
   — it passes, ruling out this crate's own dispatch logic as the cause. 42 unit tests pass.
+- **Single-capability IPC transfer** ([RFC-0010](../lantern-rfcs/rfcs/0010-cross-process-capability-transfer-and-brokering.md),
+  kernel-side prototype), in `src/ipc.rs`: `tag.extra_caps == 1` is now real, not just
+  reserved wire-format space. `Send`/`Call` read `mr1` as the sender's CPtr for a capability
+  to transfer (payload shrinks to `mr2`/`mr3`), gated on `Rights::GRANT` — the first real
+  consumer anywhere in the tree of a rights bit that has existed, unenforced, since RFC-0003.
+  `Recv` reads its own `mr1` as the receiver's destination CPtr, registered up front (at
+  block time if no sender is waiting yet) so a transfer against a receiver with no or an
+  occupied destination slot fails the *entire* rendezvous atomically — nothing is consumed,
+  no capability is dropped. `ArrayQueue` gained `front()` (peek without popping) to make that
+  atomicity possible: validate the destination before dequeuing the other party. This is a
+  real, cross-process, capability-gated transfer — not `lantern-boot/loader.rs`'s existing
+  direct-pool-write shortcut, and not yet used to replace it (see "Next"). `extra_caps > 1`
+  still has nowhere to go (no in-memory IPC buffer) and stays rejected, same as `length > 0`.
+  `Reply`'s return leg does **not** support a transfer yet and explicitly rejects any nonzero
+  `extra_caps` — RFC-0010 left `Call`'s reply-path register layout as an open question (the
+  original caller has no spare register at `Call` time to register a destination slot the
+  way `Recv`'s callers do). 51 unit tests pass (8 new, in `ipc::transfer_tests`), `cargo
+  clippy -D warnings` clean on host and `riscv64gc-unknown-none-elf`; `lantern-boot` still
+  builds unchanged against the `ThreadState::BlockedRecv`/`BlockedSend` shape change.
 
 ## Validated under real QEMU
 [`lantern-boot`](../lantern-boot)'s loader (`src/loader.rs`, RFC-0008) drives a full
@@ -74,10 +93,11 @@ own logic (covered by the `full_call_recv_reply_round_trip` unit test) needed no
   blocks) rather than by fixing it.
 - IRQ-handler objects don't exist yet (interrupt-controller HAL support is a separate,
   unstarted dependency — `lantern-hal/STATUS.md`).
-- `cnode::invoke`'s `Copy`/`Move` only operate on slots *within a single CNode* — there's no
-  cross-CNode capability-transfer primitive yet, so `lantern-boot/loader.rs` still places
-  the one capability each loaded program needs (the shared endpoint) via a direct pool
-  write rather than a real invocation. Pre-existing gap, not new from RFC-0008.
+- `cnode::invoke`'s `Copy`/`Move` still only operate on slots *within a single CNode* — that
+  part is unchanged. Cross-*process* transfer now exists, but as a separate mechanism (IPC's
+  `extra_caps == 1`, RFC-0010, above), not as a `CNodeInvoke` capability. `lantern-boot/
+  loader.rs` hasn't been migrated to it yet and still places the one capability each loaded
+  program needs via a direct pool write — see "Next".
 - **IPC round-trip loss under real QEMU, not reproducible on host.** Found while building
   `lantern-boot`'s IPC benchmark: the first `Call`/`block_current` a thread issues right
   after a warm-up round trip occasionally never actually resumes the receiver, despite
@@ -93,8 +113,16 @@ own logic (covered by the `full_call_recv_reply_round_trip` unit test) needed no
 ## Next
 - The capability-derivation tree `Revoke`/proper `Delete` reclaim need.
 - An idle thread, once `lantern-boot` can provide one.
-- A cross-CNode capability-transfer primitive, to close the one remaining direct-pool-write
-  gap `loader.rs` still has.
+- Migrate `lantern-boot/loader.rs` off its direct-pool-write shortcut onto the new
+  `extra_caps == 1` IPC transfer (RFC-0010), now that a real capability-gated mechanism
+  exists to place the shared endpoint each loaded program needs.
+- `Reply`'s return leg still can't attach a capability — RFC-0010's own "Unresolved
+  questions" left `Call`'s reply-path register layout open; needed before a
+  `Call`-then-`Reply`-with-a-granted-capability broker pattern (RFC-0010's actual motivating
+  use case) is fully real end to end.
+- The service-layer `lantern-capabilities` brokering API (`mint`/`grant`/`revoke`) RFC-0010
+  also specifies — this crate's half is done; `lantern-capabilities` itself has no prototype
+  code yet (see its own `STATUS.md`).
 - `x86-64`: exercise this crate's logic there too, once `x86-64` boot work starts
   (deferred, see `lantern-boot/STATUS.md`) — `Hal::enter_thread` is still an
   `unimplemented!()` stub on that target.

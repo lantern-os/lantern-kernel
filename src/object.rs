@@ -5,7 +5,7 @@
 
 use lantern_hal::{Hal, Hardware, MessageTag, TrapFrame, MR_COUNT};
 
-use crate::cap::{CNodeId, NotificationId, SchedContextId, TcbId, UntypedId, VSpaceId};
+use crate::cap::{Capability, CNodeId, CPtr, NotificationId, SchedContextId, TcbId, UntypedId, VSpaceId};
 use crate::queue::ArrayQueue;
 
 /// Must match [`lantern_hal`]'s `TrapFrame::raw` word count. Not exported as a
@@ -107,8 +107,24 @@ pub enum ThreadState {
         /// delivered) from a blocked `Call` (receiver instead gets a `reply_to`
         /// link back to the sender, who moves to `BlockedReply`).
         is_call: bool,
+        /// The capability this thread's `Send`/`Call` attached (`tag.extra_caps ==
+        /// 1`), already resolved and `Rights::GRANT`-checked at syscall time —
+        /// [RFC-0010](../../lantern-rfcs/rfcs/0010-cross-process-capability-transfer-and-brokering.md).
+        /// Snapshotting the resolved `Capability` here (not just the sender's
+        /// CPtr) means a later `Recv` doesn't need to re-resolve it against the
+        /// sender's CSpace, which the sender — blocked, not running — cannot have
+        /// mutated in the meantime anyway (ADR-0010: single-stack, non-reentrant).
+        extra_cap: Option<Capability>,
     },
-    BlockedRecv(crate::cap::EndpointId),
+    BlockedRecv {
+        endpoint: crate::cap::EndpointId,
+        /// The receiver's own destination CPtr for an incoming transferred
+        /// capability, registered at `Recv` time via `tag.extra_caps == 1`
+        /// (RFC-0010). `None` if the receiver didn't register one — a sender
+        /// attempting a transfer against such a receiver fails cleanly rather
+        /// than silently dropping the capability (see `crate::ipc`).
+        dest_slot: Option<CPtr>,
+    },
     /// Blocked in `Call`, waiting for the callee's `Reply`.
     BlockedReply,
     BlockedWait(NotificationId),
