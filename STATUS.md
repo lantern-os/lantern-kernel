@@ -67,6 +67,21 @@
   way `Recv`'s callers do). 51 unit tests pass (8 new, in `ipc::transfer_tests`), `cargo
   clippy -D warnings` clean on host and `riscv64gc-unknown-none-elf`; `lantern-boot` still
   builds unchanged against the `ThreadState::BlockedRecv`/`BlockedSend` shape change.
+- **`CNodeInvoke::CopyCross`** ([RFC-0010](../lantern-rfcs/rfcs/0010-cross-process-capability-transfer-and-brokering.md),
+  `src/cnode.rs`, label 6): copies a capability from a slot in one CNode into a slot in a
+  *different* CNode, gated on the caller already holding capabilities to both (the same
+  trust level ordinary same-CNode `Copy` already has). Added after discovering, while
+  trying to migrate `lantern-boot/loader.rs` onto the `extra_caps == 1` live-IPC transfer
+  above, that live transfer structurally *cannot* do this job: `Recv`ing requires already
+  holding a capability to rendezvous on, so it can't bootstrap a program's very first
+  capability (chicken-and-egg). `CopyCross` is the administrative operation that actually
+  fills `cnode.rs`'s long-standing "no cross-CNode transfer primitive" gap — a real,
+  capability-checked kernel invocation, not a pool poke, but a deliberately different
+  mechanism from RFC-0010's `Rights::GRANT`-gated live transfer, not built on top of it.
+  54 unit tests pass (3 new), `cargo clippy -D warnings` clean on host and
+  `riscv64gc-unknown-none-elf`. See `lantern-boot/STATUS.md` for the real-QEMU validation:
+  `loader.rs` now uses this instead of its old direct pool write, and the full two-program
+  IPC benchmark demo still passes end to end.
 
 ## Validated under real QEMU
 [`lantern-boot`](../lantern-boot)'s loader (`src/loader.rs`, RFC-0008) drives a full
@@ -93,11 +108,10 @@ own logic (covered by the `full_call_recv_reply_round_trip` unit test) needed no
   blocks) rather than by fixing it.
 - IRQ-handler objects don't exist yet (interrupt-controller HAL support is a separate,
   unstarted dependency — `lantern-hal/STATUS.md`).
-- `cnode::invoke`'s `Copy`/`Move` still only operate on slots *within a single CNode* — that
-  part is unchanged. Cross-*process* transfer now exists, but as a separate mechanism (IPC's
-  `extra_caps == 1`, RFC-0010, above), not as a `CNodeInvoke` capability. `lantern-boot/
-  loader.rs` hasn't been migrated to it yet and still places the one capability each loaded
-  program needs via a direct pool write — see "Next".
+- `cnode::invoke`'s original `Copy`/`Move` still only operate on slots *within a single
+  CNode* — that part is unchanged and still true. Cross-CNode placement is now possible via
+  the separate `CopyCross` operation (RFC-0010, above), used by `lantern-boot/loader.rs`
+  instead of its old direct pool write.
 - **IPC round-trip loss under real QEMU, not reproducible on host.** Found while building
   `lantern-boot`'s IPC benchmark: the first `Call`/`block_current` a thread issues right
   after a warm-up round trip occasionally never actually resumes the receiver, despite
@@ -113,9 +127,6 @@ own logic (covered by the `full_call_recv_reply_round_trip` unit test) needed no
 ## Next
 - The capability-derivation tree `Revoke`/proper `Delete` reclaim need.
 - An idle thread, once `lantern-boot` can provide one.
-- Migrate `lantern-boot/loader.rs` off its direct-pool-write shortcut onto the new
-  `extra_caps == 1` IPC transfer (RFC-0010), now that a real capability-gated mechanism
-  exists to place the shared endpoint each loaded program needs.
 - `Reply`'s return leg still can't attach a capability — RFC-0010's own "Unresolved
   questions" left `Call`'s reply-path register layout open; needed before a
   `Call`-then-`Reply`-with-a-granted-capability broker pattern (RFC-0010's actual motivating

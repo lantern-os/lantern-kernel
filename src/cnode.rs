@@ -22,6 +22,12 @@ pub const LABEL_COPY: u32 = 2;
 pub const LABEL_MOVE: u32 = 3;
 pub const LABEL_DELETE: u32 = 4;
 pub const LABEL_REVOKE: u32 = 5;
+/// Like `Copy`, but the source capability lives in a *different* CNode than the
+/// invoked (destination) one — [RFC-0010](../../lantern-rfcs/rfcs/0010-cross-process-capability-transfer-and-brokering.md)'s
+/// administrative counterpart to `crate::ipc`'s live `extra_caps == 1` transfer.
+/// See [`copy_cross`]'s doc for why these are two genuinely different
+/// mechanisms, not one built on the other.
+pub const LABEL_COPY_CROSS: u32 = 6;
 
 pub fn invoke(
     state: &mut KernelState,
@@ -44,6 +50,7 @@ pub fn invoke(
         LABEL_COPY => copy(state, target, src, dest)?,
         LABEL_MOVE => move_cap(state, target, src, dest)?,
         LABEL_DELETE => delete(state, target, src)?,
+        LABEL_COPY_CROSS => copy_cross(state, current, target, src, dest, arg3)?,
         LABEL_REVOKE => {
             // Recursive revocation needs a capability-derivation tree Phase 1
             // doesn't track yet (RFC-0005 already named "revocation cost model" as
@@ -147,6 +154,57 @@ fn delete(state: &mut KernelState, target: CNodeId, src: usize) -> Result<(), Sy
         return Err(SyscallError::InvalidCapability);
     }
     *slot = Capability::Null;
+    Ok(())
+}
+
+/// `CNodeInvoke::CopyCross` — copies a capability from `source_slot` in a
+/// *different* CNode (`source_cnode`, a CPtr resolved in the **caller's own**
+/// CSpace, distinct from `target`, the invoked/destination CNode from `mr0`)
+/// into `target`'s `dest` slot.
+///
+/// **Why this exists alongside `crate::ipc`'s live `extra_caps == 1` transfer,
+/// rather than loader code just using that instead:** live transfer needs an
+/// already-running receiver to `Recv` with a registered destination slot — but
+/// a receiver needs *some* capability (an endpoint, at minimum) to `Recv` on in
+/// the first place. It cannot bootstrap a program's very first capability
+/// (chicken-and-egg). `CopyCross` is the administrative operation that seeds
+/// that first capability instead — the same role seL4's root-task CNode
+/// manipulation plays. It's gated the same way ordinary same-CNode `Copy`
+/// already is: holding a `Capability::CNode` is unrestricted read/write access
+/// to everything in it (Phase 1's flat-CSpace model), for *both* CNodes named
+/// here, not just one. This is real capability-checked administration, not a
+/// pool poke — but it is not RFC-0010's `Rights::GRANT`-gated authority
+/// transfer between mutually distrusting, already-running parties; conflating
+/// the two would either weaken the live-transfer trust model or make bootstrap
+/// impossible, so they stay two distinct mechanisms.
+fn copy_cross(
+    state: &mut KernelState,
+    current: TcbId,
+    target: CNodeId,
+    source_cnode: CPtr,
+    source_slot: usize,
+    dest: usize,
+) -> Result<(), SyscallError> {
+    let source_id = match state.lookup_cap(current, source_cnode)? {
+        Capability::CNode(id) => id,
+        _ => return Err(SyscallError::InvalidCapability),
+    };
+    let source_cap = state
+        .cnodes
+        .get(source_id.0 as usize)
+        .ok_or(SyscallError::InvalidCapability)?
+        .get(source_slot)
+        .ok_or(SyscallError::RangeError)?;
+    if source_cap == Capability::Null {
+        return Err(SyscallError::InvalidCapability);
+    }
+
+    let target_cnode = state.cnodes.get_mut(target.0 as usize).ok_or(SyscallError::InvalidCapability)?;
+    let dest_slot = target_cnode.slot_mut(dest).ok_or(SyscallError::RangeError)?;
+    if *dest_slot != Capability::Null {
+        return Err(SyscallError::IllegalOperation);
+    }
+    *dest_slot = source_cap;
     Ok(())
 }
 
@@ -255,5 +313,67 @@ mod tests {
         let (mut state, tcb, self_cptr) = setup();
         let mut frame = frame_for(LABEL_REVOKE, self_cptr, 5, 0, 0);
         assert_eq!(invoke(&mut state, tcb, self_cptr, &mut frame), Err(SyscallError::IllegalOperation));
+    }
+
+    /// One thread, one CSpace (`cnode_a`, pool index 0), holding capabilities to
+    /// *two* CNodes: a self-reference at slot 0 (`cnode_a` itself — `CopyCross`'s
+    /// `source_cnode` argument) and a second, genuinely different CNode
+    /// (`cnode_b`, pool index 1) at slot 1 (`CopyCross`'s invoked/destination
+    /// argument, `mr0`). Returns `(state, tcb, dest_cptr, source_cnode_cptr)`.
+    fn setup_cross() -> (KernelState, TcbId, CPtr, CPtr) {
+        let mut state = KernelState::new();
+        let cnode_a = CNodeId(state.cnodes.alloc(CNode::empty()).unwrap() as u16);
+        let cnode_b = CNodeId(state.cnodes.alloc(CNode::empty()).unwrap() as u16);
+
+        let tcb_idx = state.tcbs.alloc(crate::object::Tcb::new()).unwrap();
+        let tcb_id = TcbId(tcb_idx as u16);
+        state.tcbs.get_mut(tcb_idx).unwrap().cspace = Some(cnode_a);
+
+        *state.cnodes.get_mut(cnode_a.0 as usize).unwrap().slot_mut(0).unwrap() = Capability::CNode(cnode_a);
+        *state.cnodes.get_mut(cnode_a.0 as usize).unwrap().slot_mut(1).unwrap() = Capability::CNode(cnode_b);
+
+        (state, tcb_id, 1, 0)
+    }
+
+    #[test]
+    fn copy_cross_places_a_capability_from_a_different_cnode() {
+        let (mut state, tcb, dest_cptr, source_cnode_cptr) = setup_cross();
+        let ep = Capability::Endpoint { id: EndpointId(1), badge: 42, rights: Rights::ALL };
+        *state.cnodes.get_mut(0).unwrap().slot_mut(5).unwrap() = ep; // cnode_a, slot 5
+
+        let mut frame = frame_for(LABEL_COPY_CROSS, dest_cptr, source_cnode_cptr, 5, 9);
+        invoke(&mut state, tcb, dest_cptr, &mut frame).unwrap();
+
+        // Landed in cnode_b (pool index 1), slot 9.
+        assert_eq!(state.cnodes.get(1).unwrap().get(9), Some(ep));
+        // Source untouched -- this is a copy, not a move.
+        assert_eq!(state.cnodes.get(0).unwrap().get(5), Some(ep));
+    }
+
+    #[test]
+    fn copy_cross_into_an_occupied_destination_slot_is_rejected() {
+        let (mut state, tcb, dest_cptr, source_cnode_cptr) = setup_cross();
+        let ep = Capability::Endpoint { id: EndpointId(1), badge: 0, rights: Rights::ALL };
+        *state.cnodes.get_mut(0).unwrap().slot_mut(5).unwrap() = ep;
+        // cnode_b's slot 9 is already occupied by something.
+        *state.cnodes.get_mut(1).unwrap().slot_mut(9).unwrap() = ep;
+
+        let mut frame = frame_for(LABEL_COPY_CROSS, dest_cptr, source_cnode_cptr, 5, 9);
+        assert_eq!(invoke(&mut state, tcb, dest_cptr, &mut frame), Err(SyscallError::IllegalOperation));
+    }
+
+    #[test]
+    fn copy_cross_rejects_a_source_argument_that_is_not_a_cnode_capability() {
+        let (mut state, tcb, dest_cptr, _source_cnode_cptr) = setup_cross();
+        let ep = Capability::Endpoint { id: EndpointId(1), badge: 0, rights: Rights::ALL };
+        // Slot 1 in the caller's own CSpace names cnode_b, a real CNode -- but
+        // not one holding a plain-capability source at slot 5, and slot 1's
+        // target is what CopyCross's own `mr0` already claims as the
+        // destination. Point `source_cnode` (mr1) at a slot that isn't a CNode
+        // capability at all instead (slot 5, an Endpoint).
+        *state.cnodes.get_mut(0).unwrap().slot_mut(5).unwrap() = ep;
+
+        let mut frame = frame_for(LABEL_COPY_CROSS, dest_cptr, 5, 0, 9);
+        assert_eq!(invoke(&mut state, tcb, dest_cptr, &mut frame), Err(SyscallError::InvalidCapability));
     }
 }
