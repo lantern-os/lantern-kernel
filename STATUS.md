@@ -82,6 +82,28 @@
   `riscv64gc-unknown-none-elf`. See `lantern-boot/STATUS.md` for the real-QEMU validation:
   `loader.rs` now uses this instead of its old direct pool write, and the full two-program
   IPC benchmark demo still passes end to end.
+- **`Reply`'s return-leg transfer** (RFC-0010's own "Unresolved questions" item, now
+  resolved), in `src/ipc.rs`: `Reply` supports `tag.extra_caps == 1` with the same `mr1`
+  convention `Send` uses. The actual open question — where does the *original caller*
+  register a destination slot, given `Call` has no spare register once `mr1` names an
+  outbound transfer — is resolved by giving `extra_caps` a second, `Call`-only meaning:
+  `== 1` still means "attach an outbound capability" (unchanged), `== 2` now means "no
+  outbound transfer this call, but `mr1` is my own destination slot for a capability the
+  `Reply` might attach." The two are mutually exclusive per call — Phase 1's three payload
+  words have no room for both at once, so `Call` picks one meaning for `mr1`, never two.
+  `ThreadState::BlockedSend` gained a `reply_dest_slot` field to carry this from `Call`
+  through to `ThreadState::BlockedReply` (now `{ dest_slot: Option<CPtr> }` instead of a
+  unit variant) once a `Recv` actually picks the caller up; the immediate-rendezvous path
+  sets it directly. Same atomicity discipline as the rest of RFC-0010's transfer work: a
+  `Reply` attempting a transfer against a caller with no registered destination fails
+  cleanly (`IllegalOperation`) *before* consuming the `reply_to` link, so the caller isn't
+  stranded and can be replied to again. `abi::require_no_extra_caps` is gone — `Reply` now
+  shares `require_fast_path_only` with `Send`/`Recv` (accepts `0` or `1`); `Call` gets its
+  own `require_call_tag` (accepts `0`, `1`, or `2`). 57 unit tests pass (3 new; 2 existing
+  `ipc::transfer_tests` updated for the `ThreadState::BlockedReply` shape change), `cargo
+  clippy -D warnings` clean on host and `riscv64gc-unknown-none-elf`; `lantern-boot`'s full
+  two-program QEMU demo (2000-round-trip benchmark, plain `Call`/`Reply`, `extra_caps == 0`
+  throughout) re-verified unaffected, same latency range as before.
 
 ## Validated under real QEMU
 [`lantern-boot`](../lantern-boot)'s loader (`src/loader.rs`, RFC-0008) drives a full
@@ -127,13 +149,10 @@ own logic (covered by the `full_call_recv_reply_round_trip` unit test) needed no
 ## Next
 - The capability-derivation tree `Revoke`/proper `Delete` reclaim need.
 - An idle thread, once `lantern-boot` can provide one.
-- `Reply`'s return leg still can't attach a capability — RFC-0010's own "Unresolved
-  questions" left `Call`'s reply-path register layout open; needed before a
-  `Call`-then-`Reply`-with-a-granted-capability broker pattern (RFC-0010's actual motivating
-  use case) is fully real end to end.
-- The service-layer `lantern-capabilities` brokering API (`mint`/`grant`/`revoke`) RFC-0010
-  also specifies — this crate's half is done; `lantern-capabilities` itself has no prototype
-  code yet (see its own `STATUS.md`).
+- RFC-0010's kernel-side scope is now fully implemented (outbound transfer, `CopyCross`,
+  reply-leg transfer). `lantern-capabilities`' `Broker` (see its own `STATUS.md`) still
+  grants over a plain `Send`, not `Call`/`Reply` — updating it to use the now-real
+  reply-leg transfer for the more natural request/response grant shape is unstarted.
 - `x86-64`: exercise this crate's logic there too, once `x86-64` boot work starts
   (deferred, see `lantern-boot/STATUS.md`) — `Hal::enter_thread` is still an
   `unimplemented!()` stub on that target.

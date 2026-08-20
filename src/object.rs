@@ -115,6 +115,13 @@ pub enum ThreadState {
         /// sender's CSpace, which the sender — blocked, not running — cannot have
         /// mutated in the meantime anyway (ADR-0010: single-stack, non-reentrant).
         extra_cap: Option<Capability>,
+        /// For a blocked `Call` only (`is_call == true`): the destination CPtr
+        /// this caller registered (`tag.extra_caps == 2` on the `Call`,
+        /// mutually exclusive with `extra_cap` above — see `crate::ipc::call`)
+        /// for a capability that might come back on the eventual `Reply`.
+        /// Carried through to `ThreadState::BlockedReply` once a `Recv`
+        /// actually picks this sender up. Always `None` for a plain `Send`.
+        reply_dest_slot: Option<CPtr>,
     },
     BlockedRecv {
         endpoint: crate::cap::EndpointId,
@@ -125,8 +132,13 @@ pub enum ThreadState {
         /// than silently dropping the capability (see `crate::ipc`).
         dest_slot: Option<CPtr>,
     },
-    /// Blocked in `Call`, waiting for the callee's `Reply`.
-    BlockedReply,
+    /// Blocked in `Call`, waiting for the callee's `Reply`. `dest_slot` is this
+    /// caller's own registered destination for a capability the `Reply` might
+    /// attach (`tag.extra_caps == 2` on the original `Call` — RFC-0010's
+    /// reply-leg transfer, `crate::ipc::call`/`crate::ipc::reply`), carried
+    /// over from `BlockedSend`'s `reply_dest_slot` if this thread went through
+    /// that state first, or set directly on an immediate rendezvous.
+    BlockedReply { dest_slot: Option<CPtr> },
     BlockedWait(NotificationId),
 }
 

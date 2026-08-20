@@ -19,12 +19,24 @@
 //!   silently dropping the extra words — Phase 1's fast path is register-only.
 //! - **Single-capability transfer (`tag.extra_caps == 1`) is implemented** ([RFC-0010](../../lantern-rfcs/rfcs/0010-cross-process-capability-transfer-and-brokering.md)),
 //!   in [`crate::ipc`]: `Send`/`Call` treat `mr1` as the sender's CPtr for the
-//!   capability being transferred (payload shrinks to `mr2`/`mr3`), and `Recv`
-//!   treats its own `mr1` as the receiver's destination CPtr. `tag.extra_caps > 1`
-//!   still has nowhere to go (no in-memory IPC buffer exists) and is rejected the
-//!   same way `length > 0` is. `Reply`'s return leg does not support a transfer
-//!   yet — RFC-0010 left its exact register layout as an open question — and
-//!   still rejects any nonzero `extra_caps`.
+//!   capability being transferred (payload shrinks to `mr2`/`mr3`), `Recv` treats
+//!   its own `mr1` as the receiver's destination CPtr, and `Reply` treats its own
+//!   `mr1` the same way `Send`'s does (the replier's transfer CPtr). `tag.extra_caps
+//!   > 1` on `Send`/`Recv`/`Reply` still has nowhere to go (no in-memory IPC
+//!   buffer exists) and is rejected the same way `length > 0` is.
+//! - **`Call`'s reply-leg destination (`tag.extra_caps == 2`, `Call`-only) is
+//!   implemented.** This is what RFC-0010 originally left as an open question
+//!   ("no spare register at `Call` time to register a destination slot"): the
+//!   answer is a second, `Call`-specific meaning for `extra_caps`, mutually
+//!   exclusive with `== 1`'s outbound-transfer meaning. `tag.extra_caps == 2`
+//!   means "no outbound transfer *this* call, but `mr1` is my own destination
+//!   CPtr for a capability the eventual `Reply` might attach" — carried via
+//!   `ThreadState::BlockedSend.reply_dest_slot`/`ThreadState::BlockedReply.dest_slot`
+//!   through to whenever `Reply` actually runs. A single `Call` cannot both
+//!   attach an outbound capability *and* register a reply destination — Phase 1's
+//!   three payload words have no room for a fourth argument; `Call` only ever
+//!   needed to pick one meaning for `mr1` at a time, unlike `Send`, which never
+//!   needs the "register a destination" meaning at all (only `Recv` does).
 
 use lantern_hal::{MessageTag, TrapFrame, FLAG_ERROR};
 
@@ -55,12 +67,11 @@ pub fn require_fast_path_only(tag: MessageTag) -> Result<(), SyscallError> {
     }
 }
 
-/// `Reply`'s stricter check: its return leg doesn't support capability transfer
-/// yet (RFC-0010 left the register layout for it unresolved), so unlike
-/// `require_fast_path_only`, *any* nonzero `extra_caps` is rejected here, not
-/// just `> 1`.
-pub fn require_no_extra_caps(tag: MessageTag) -> Result<(), SyscallError> {
-    if tag.length > 0 || tag.extra_caps > 0 {
+/// `Call`'s own check: like [`require_fast_path_only`], but `Call` additionally
+/// understands `extra_caps == 2` (register a reply-leg destination slot — see
+/// the module doc), so the accepted range is `0..=2`, not `0..=1`.
+pub fn require_call_tag(tag: MessageTag) -> Result<(), SyscallError> {
+    if tag.length > 0 || tag.extra_caps > 2 {
         Err(SyscallError::TruncatedMessage)
     } else {
         Ok(())
