@@ -148,9 +148,10 @@ own logic (covered by the `full_call_recv_reply_round_trip` unit test) needed no
 
 ## Next
 - The capability-derivation tree `Revoke`/proper `Delete` reclaim need — more pressing in
-  Phase 3: [RFC-0018](../lantern-rfcs/rfcs/0018-confined-execution-port.md) (Draft, the
-  confined-execution port) needs real `Revoke` for "a revocable capability set" on a
-  still-running app; it does not block that RFC's v0 (tear the process down instead).
+  Phase 3: [RFC-0018](../lantern-rfcs/rfcs/0018-confined-execution-port.md) (Accepted;
+  [ADR-0022](../lantern-rfcs/adr/0022-confined-service-model-and-call-transport.md)/[ADR-0023](../lantern-rfcs/adr/0023-wasmtime-no-std-pulley-hosting.md))
+  needs real `Revoke` for "a revocable capability set" on a still-running app; it does not
+  block that work's v0 (tear the process down instead).
 - An idle thread, once `lantern-boot` can provide one — RFC-0018's synchronous
   request/reply service mesh never reaches "all threads blocked", but `lantern-network`'s
   first blocking socket read will need it.
