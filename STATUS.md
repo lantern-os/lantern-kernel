@@ -147,8 +147,13 @@ own logic (covered by the `full_call_recv_reply_round_trip` unit test) needed no
   `lantern-boot` call site with extra tolerated round trips, not fixed here.
 
 ## Next
-- The capability-derivation tree `Revoke`/proper `Delete` reclaim need.
-- An idle thread, once `lantern-boot` can provide one.
+- The capability-derivation tree `Revoke`/proper `Delete` reclaim need — more pressing in
+  Phase 3: [RFC-0018](../lantern-rfcs/rfcs/0018-confined-execution-port.md) (Draft, the
+  confined-execution port) needs real `Revoke` for "a revocable capability set" on a
+  still-running app; it does not block that RFC's v0 (tear the process down instead).
+- An idle thread, once `lantern-boot` can provide one — RFC-0018's synchronous
+  request/reply service mesh never reaches "all threads blocked", but `lantern-network`'s
+  first blocking socket read will need it.
 - RFC-0010's kernel-side scope is now fully implemented (outbound transfer, `CopyCross`,
   reply-leg transfer). `lantern-capabilities`' `Broker` (see its own `STATUS.md`) still
   grants over a plain `Send`, not `Call`/`Reply` — updating it to use the now-real
