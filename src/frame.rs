@@ -21,6 +21,13 @@ use crate::object::FrameSize;
 use crate::state::KernelState;
 
 pub const LABEL_MAP: u32 = 1;
+/// `Unmap`'s `mr1` names the VSpace to remove *this* Frame's mapping from —
+/// added in Phase 3 ([ADR-0022](../../lantern-rfcs/adr/0022-confined-service-model-and-call-transport.md)
+/// Part 2) alongside multi-mapping support; Phase 1's single-mapping `Unmap`
+/// took no argument because there was never more than one mapping to choose
+/// between. No Phase 1/2 caller ever invoked `Unmap` for real (grep confirms
+/// only this module's own tests do), so this is a clean ABI widening, not a
+/// break.
 pub const LABEL_UNMAP: u32 = 2;
 
 /// `mr3`'s bit layout for `Map` — see the module doc.
@@ -67,7 +74,7 @@ pub fn invoke(
 
     match frame.tag().label {
         LABEL_MAP => map(state, current, frame_id, frame)?,
-        LABEL_UNMAP => unmap(state, frame_id)?,
+        LABEL_UNMAP => unmap(state, current, frame_id, frame)?,
         _ => return Err(SyscallError::InvalidArgument),
     }
     abi::reply_success(frame);
@@ -89,9 +96,11 @@ fn map(
     let perms = PermFlags(frame.mr(3));
 
     let f = state.frames.get(frame_id.0 as usize).ok_or(SyscallError::InvalidCapability)?;
-    if f.mapped_at.is_some() {
-        return Err(SyscallError::IllegalOperation);
-    }
+    // A free slot in `mapped_at` — `IllegalOperation` once every slot this
+    // Frame has (`MAX_FRAME_MAPPINGS`) is already in use. Phase 1 rejected any
+    // second mapping outright; Phase 3 (ADR-0022 Part 2) allows up to two, for
+    // exactly the RFC-0019 shared (runtime, service) Frame case.
+    let free_slot = f.mapped_at.iter().position(Option::is_none).ok_or(SyscallError::IllegalOperation)?;
     let (paddr, size) = (f.paddr, f.size);
     if !vaddr.is_multiple_of(size.bytes()) {
         return Err(SyscallError::AlignmentError);
@@ -155,15 +164,26 @@ fn map(
     }
 
     let f = state.frames.get_mut(frame_id.0 as usize).expect("checked above");
-    f.mapped_at = Some((vspace_id, vaddr));
+    f.mapped_at[free_slot] = Some((vspace_id, vaddr));
     Ok(())
 }
 
-fn unmap(state: &mut KernelState, frame_id: FrameId) -> Result<(), SyscallError> {
-    let f = state.frames.get(frame_id.0 as usize).ok_or(SyscallError::InvalidCapability)?;
-    let Some((vspace_id, vaddr)) = f.mapped_at else {
-        return Ok(()); // Not currently mapped anywhere — a harmless no-op.
+/// `mr1` names the VSpace whose mapping of this Frame should be removed —
+/// see [`LABEL_UNMAP`]'s doc. Resolved the same way `map`'s own `mr1` is
+/// (a `VSpace` capability in `current`'s CSpace, `Rights::WRITE` required),
+/// so unmapping needs the same authority mapping does.
+fn unmap(state: &mut KernelState, current: TcbId, frame_id: FrameId, frame: &TrapFrame) -> Result<(), SyscallError> {
+    let vspace_id = match state.lookup_cap(current, frame.mr(1))? {
+        Capability::VSpace { id, rights } if rights.contains(Rights::WRITE) => id,
+        Capability::VSpace { .. } => return Err(SyscallError::IllegalOperation),
+        _ => return Err(SyscallError::InvalidCapability),
     };
+
+    let f = state.frames.get(frame_id.0 as usize).ok_or(SyscallError::InvalidCapability)?;
+    let Some(slot) = f.mapped_at.iter().position(|m| matches!(m, Some((v, _)) if *v == vspace_id)) else {
+        return Ok(()); // Not currently mapped into this VSpace — a harmless no-op.
+    };
+    let vaddr = f.mapped_at[slot].expect("position() just found a Some entry").1;
 
     let vspace = state.vspaces.get(vspace_id.0 as usize).ok_or(SyscallError::InvalidCapability)?;
     let root = vspace.root as *mut lantern_hal::Riscv64PageTable;
@@ -171,7 +191,7 @@ fn unmap(state: &mut KernelState, frame_id: FrameId) -> Result<(), SyscallError>
     unsafe { lantern_hal::riscv64_unmap(root, vaddr) };
 
     let f = state.frames.get_mut(frame_id.0 as usize).expect("checked above");
-    f.mapped_at = None;
+    f.mapped_at[slot] = None;
     Ok(())
 }
 
@@ -250,7 +270,7 @@ mod tests {
         // SAFETY: `root` is this test's own retyped VSpace's real backing page.
         let translated = unsafe { lantern_hal::riscv64_translate(root as *const _, vaddr) };
         assert_eq!(translated, Some(paddr));
-        assert_eq!(state.frames.get(frame_id.0 as usize).unwrap().mapped_at, Some((vspace_id, vaddr)));
+        assert!(state.frames.get(frame_id.0 as usize).unwrap().mapped_at.contains(&Some((vspace_id, vaddr))));
     }
 
     #[test]
@@ -271,7 +291,16 @@ mod tests {
     }
 
     #[test]
-    fn map_rejects_an_already_mapped_frame() {
+    fn map_rejects_a_second_mapping_into_the_same_vspace() {
+        // Not what `MAX_FRAME_MAPPINGS` is for (ADR-0022 Part 2's shared Frame
+        // needs two *different* VSpaces) -- `riscv64_translate`'s "already
+        // mapped at this vaddr" check doesn't apply since the second attempt
+        // uses a different vaddr, so this specifically exercises that mapping
+        // twice into one VSpace isn't itself blocked by that check; it's a
+        // wasteful, harmless edge case (the caller already holds WRITE on both
+        // the Frame and the VSpace), not tested further than "it doesn't
+        // panic or corrupt state" -- superseded by the cap test below for the
+        // security-relevant property.
         let mut arena = TestArena([0; 64 * 1024]);
         let (mut state, tcb, frame_cptr, vspace_cptr) = setup(&mut arena);
 
@@ -283,7 +312,58 @@ mod tests {
         let mut frame2 = map_frame(PermFlags::READ);
         frame2.set_mr(1, vspace_cptr);
         frame2.set_mr(2, 0x2000_0000);
-        assert_eq!(invoke(&mut state, tcb, frame_cptr, &mut frame2), Err(SyscallError::IllegalOperation));
+        invoke(&mut state, tcb, frame_cptr, &mut frame2).unwrap();
+    }
+
+    #[test]
+    fn map_allows_exactly_two_simultaneous_mappings_then_rejects_a_third() {
+        // ADR-0022 Part 2: the RFC-0019 shared Frame needs a runtime process
+        // and one service to both hold a live mapping of the same physical
+        // page at once -- `MAX_FRAME_MAPPINGS == 2`, not unbounded.
+        let mut arena = TestArena([0; 64 * 1024]);
+        let (mut state, tcb, frame_cptr, vspace_cptr) = setup(&mut arena);
+
+        // `setup`'s Untyped (budget 4, cptr 1) has used 2 so far (1 VSpace, 1
+        // Frame); two more VSpace retypes exactly exhausts it.
+        let vspace2_cptr: CPtr = 4;
+        let mut retype_vspace2 = TrapFrame::zeroed();
+        retype_vspace2.set_mr(1, ObjectType::VSpace as usize);
+        retype_vspace2.set_mr(2, vspace2_cptr);
+        admin::untyped_retype(&mut state, tcb, 1, &mut retype_vspace2).unwrap();
+        let vspace3_cptr: CPtr = 5;
+        let mut retype_vspace3 = TrapFrame::zeroed();
+        retype_vspace3.set_mr(1, ObjectType::VSpace as usize);
+        retype_vspace3.set_mr(2, vspace3_cptr);
+        admin::untyped_retype(&mut state, tcb, 1, &mut retype_vspace3).unwrap();
+
+        let mut frame1 = map_frame(PermFlags::READ);
+        frame1.set_mr(1, vspace_cptr);
+        frame1.set_mr(2, 0x1000_0000);
+        invoke(&mut state, tcb, frame_cptr, &mut frame1).unwrap();
+
+        let mut frame2 = map_frame(PermFlags::READ);
+        frame2.set_mr(1, vspace2_cptr);
+        frame2.set_mr(2, 0x2000_0000);
+        invoke(&mut state, tcb, frame_cptr, &mut frame2).unwrap();
+
+        let Capability::Frame { id: frame_id, .. } = state.lookup_cap(tcb, frame_cptr).unwrap() else {
+            panic!("expected a Frame capability");
+        };
+        let Capability::VSpace { id: vspace_id, .. } = state.lookup_cap(tcb, vspace_cptr).unwrap() else {
+            panic!("expected a VSpace capability");
+        };
+        let Capability::VSpace { id: vspace2_id, .. } = state.lookup_cap(tcb, vspace2_cptr).unwrap() else {
+            panic!("expected a VSpace capability");
+        };
+        let mapped = state.frames.get(frame_id.0 as usize).unwrap().mapped_at;
+        assert!(mapped.contains(&Some((vspace_id, 0x1000_0000))));
+        assert!(mapped.contains(&Some((vspace2_id, 0x2000_0000))));
+
+        // A third simultaneous mapping is rejected: both slots are full.
+        let mut frame3 = map_frame(PermFlags::READ);
+        frame3.set_mr(1, vspace3_cptr);
+        frame3.set_mr(2, 0x3000_0000);
+        assert_eq!(invoke(&mut state, tcb, frame_cptr, &mut frame3), Err(SyscallError::IllegalOperation));
     }
 
     #[test]
@@ -314,12 +394,13 @@ mod tests {
 
         let mut unmap = TrapFrame::zeroed();
         unmap.set_tag(MessageTag { label: LABEL_UNMAP, length: 0, extra_caps: 0, flags: 0 });
+        unmap.set_mr(1, vspace_cptr);
         invoke(&mut state, tcb, frame_cptr, &mut unmap).unwrap();
 
         let Capability::Frame { id: frame_id, .. } = state.lookup_cap(tcb, frame_cptr).unwrap() else {
             panic!("expected a Frame capability");
         };
-        assert_eq!(state.frames.get(frame_id.0 as usize).unwrap().mapped_at, None);
+        assert!(state.frames.get(frame_id.0 as usize).unwrap().mapped_at.iter().all(Option::is_none));
         // SAFETY: `root` is this test's own retyped VSpace's real backing page.
         assert_eq!(unsafe { lantern_hal::riscv64_translate(root as *const _, vaddr) }, None);
     }
@@ -327,9 +408,46 @@ mod tests {
     #[test]
     fn unmapping_an_unmapped_frame_is_a_harmless_no_op() {
         let mut arena = TestArena([0; 64 * 1024]);
-        let (mut state, tcb, frame_cptr, _vspace_cptr) = setup(&mut arena);
+        let (mut state, tcb, frame_cptr, vspace_cptr) = setup(&mut arena);
         let mut unmap = TrapFrame::zeroed();
         unmap.set_tag(MessageTag { label: LABEL_UNMAP, length: 0, extra_caps: 0, flags: 0 });
+        unmap.set_mr(1, vspace_cptr); // a real VSpace, just never mapped into.
         assert_eq!(invoke(&mut state, tcb, frame_cptr, &mut unmap), Ok(()));
+    }
+
+    #[test]
+    fn unmap_only_clears_the_named_vspaces_mapping() {
+        // The other simultaneous mapping (ADR-0022 Part 2) must survive.
+        let mut arena = TestArena([0; 64 * 1024]);
+        let (mut state, tcb, frame_cptr, vspace_cptr) = setup(&mut arena);
+        let vspace2_cptr: CPtr = 4;
+        let mut retype_vspace2 = TrapFrame::zeroed();
+        retype_vspace2.set_mr(1, ObjectType::VSpace as usize);
+        retype_vspace2.set_mr(2, vspace2_cptr);
+        admin::untyped_retype(&mut state, tcb, 1, &mut retype_vspace2).unwrap();
+
+        let mut frame1 = map_frame(PermFlags::READ);
+        frame1.set_mr(1, vspace_cptr);
+        frame1.set_mr(2, 0x1000_0000);
+        invoke(&mut state, tcb, frame_cptr, &mut frame1).unwrap();
+        let mut frame2 = map_frame(PermFlags::READ);
+        frame2.set_mr(1, vspace2_cptr);
+        frame2.set_mr(2, 0x2000_0000);
+        invoke(&mut state, tcb, frame_cptr, &mut frame2).unwrap();
+
+        let mut unmap = TrapFrame::zeroed();
+        unmap.set_tag(MessageTag { label: LABEL_UNMAP, length: 0, extra_caps: 0, flags: 0 });
+        unmap.set_mr(1, vspace_cptr);
+        invoke(&mut state, tcb, frame_cptr, &mut unmap).unwrap();
+
+        let Capability::Frame { id: frame_id, .. } = state.lookup_cap(tcb, frame_cptr).unwrap() else {
+            panic!("expected a Frame capability");
+        };
+        let Capability::VSpace { id: vspace2_id, .. } = state.lookup_cap(tcb, vspace2_cptr).unwrap() else {
+            panic!("expected a VSpace capability");
+        };
+        let mapped = state.frames.get(frame_id.0 as usize).unwrap().mapped_at;
+        assert!(mapped.contains(&Some((vspace2_id, 0x2000_0000))), "the other mapping must survive");
+        assert_eq!(mapped.iter().filter(|m| m.is_some()).count(), 1);
     }
 }

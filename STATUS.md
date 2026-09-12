@@ -105,6 +105,24 @@
   two-program QEMU demo (2000-round-trip benchmark, plain `Call`/`Reply`, `extra_caps == 0`
   throughout) re-verified unaffected, same latency range as before.
 
+- **`Frame` may now be mapped into up to two VSpaces at once** (2026-09-13,
+  [ADR-0022](../lantern-rfcs/adr/0022-confined-service-model-and-call-transport.md) Part 2 —
+  see its "Implementation note"). `Frame::mapped_at` widened from
+  `Option<(VSpaceId, usize)>` to `[Option<(VSpaceId, usize)>; MAX_FRAME_MAPPINGS]`
+  (`MAX_FRAME_MAPPINGS == 2`, deliberately not a general N-way sharing primitive — exactly
+  the RFC-0019 shared `(runtime, service)` `Frame` case). `map` now finds any free slot
+  instead of refusing a second mapping outright; `FrameInvoke::Unmap` gained an `mr1`
+  argument (which VSpace's mapping to remove — mirrors `Map`'s own `mr1`), since "the"
+  mapping is no longer unambiguous once there can be two. Confirmed no Phase 1/2 caller
+  ever invoked `Unmap` for real before this (only this crate's own tests did) — a clean
+  ABI widening, not a break. 5 new/rewritten tests (a second simultaneous mapping now
+  succeeds, a third is rejected once both slots are full, `Unmap` clears only the VSpace it
+  names and leaves the other mapping intact) — 59 total, `cargo clippy --all-targets -D
+  warnings` clean host + `riscv64`. `THREAT_MODEL.md` updated (a new asset entry + K9: the
+  kernel enforces only the mapping *count*, never a third VSpace; content-level races
+  across the two mappers are each service's own copy-in-before-validate discipline,
+  RFC-0019, not a kernel-enforced property).
+
 ## Validated under real QEMU
 [`lantern-boot`](../lantern-boot)'s loader (`src/loader.rs`, RFC-0008) drives a full
 `Call`→`Recv`→`Reply` round trip through real `riscv64` traps under `qemu-system-riscv64`,
@@ -115,6 +133,11 @@ is also where `lantern-hal`'s `riscv64` trap trampoline bug was originally caugh
 `lantern-hal/STATUS.md`): the trampoline only ever wrote back `mr0..mr3`/the tag to real
 registers, silently discarding every context switch. Fixed there, not here — this crate's
 own logic (covered by the `full_call_recv_reply_round_trip` unit test) needed no changes.
+`lantern-boot`'s third demo (`lantern-boot-frame-demo`, 2026-09-13) now also validates the
+new two-mapping `Frame` support for real: one 4 KiB `Frame` mapped into two independently
+loaded, mutually confined programs' VSpaces at once, with real bytes (`Channel::call`'s
+request, transformed, `Channel::reply`'s response) crossing through it — 3/3 reproducible
+runs.
 
 ## Known Phase 1 gaps (documented in code, not silent)
 - `Untyped`'s count-based budget (`remaining`) still isn't backed by a *general* physical

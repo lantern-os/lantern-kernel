@@ -98,8 +98,10 @@ pub fn untyped_retype(
             let size = if object_type == ObjectType::FrameSmall { FrameSize::Small } else { FrameSize::Mega };
             let untyped = state.untypeds.get_mut(untyped_id.0 as usize).expect("checked above");
             let paddr = untyped.bump(size.bytes(), size.bytes()).ok_or(SyscallError::NotEnoughMemory)?;
-            let idx =
-                state.frames.alloc(Frame { paddr, size, mapped_at: None }).ok_or(SyscallError::NotEnoughMemory)?;
+            let idx = state
+                .frames
+                .alloc(Frame { paddr, size, mapped_at: [None; crate::object::MAX_FRAME_MAPPINGS] })
+                .ok_or(SyscallError::NotEnoughMemory)?;
             Capability::Frame { id: FrameId(idx as u16), rights: Rights::ALL }
         }
         // Untyped isn't a valid retype *target* (there's nothing to split a
@@ -356,7 +358,7 @@ mod tests {
         assert_eq!(first.size, FrameSize::Small);
         assert_eq!(first.paddr % lantern_hal::RISCV64_PAGE_SIZE, 0);
         assert_ne!(first.paddr, second.paddr, "two retypes must never alias the same page");
-        assert!(first.mapped_at.is_none());
+        assert!(first.mapped_at.iter().all(Option::is_none));
     }
 
     #[test]
@@ -385,7 +387,7 @@ mod tests {
         let mega = state.frames.get(id.0 as usize).unwrap();
         assert_eq!(mega.size, FrameSize::Mega);
         assert_eq!(mega.paddr % lantern_hal::RISCV64_MEGAPAGE_SIZE, 0);
-        assert!(mega.mapped_at.is_none());
+        assert!(mega.mapped_at.iter().all(Option::is_none));
     }
 
     #[test]

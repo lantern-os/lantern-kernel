@@ -324,6 +324,14 @@ pub struct VSpace {
     pub(crate) source: UntypedId,
 }
 
+/// The most VSpaces one [`Frame`] may be mapped into at once —
+/// [ADR-0022](../../lantern-rfcs/adr/0022-confined-service-model-and-call-transport.md)
+/// Part 2's shared `Frame`: exactly one runtime process and one service, never
+/// more. Deliberately not a general N-way sharing primitive — a third or
+/// fourth simultaneous mapping is a new decision (and a new ADR/RFC), not an
+/// oversight in this constant.
+pub const MAX_FRAME_MAPPINGS: usize = 2;
+
 /// One physical page usable as a `FrameInvoke` mapping target — RFC-0008/
 /// ADR-0012. `paddr` is real physical memory, from the owning Untyped's
 /// `memory` range, sized per `size`.
@@ -331,11 +339,16 @@ pub struct VSpace {
 pub struct Frame {
     pub paddr: usize,
     pub size: FrameSize,
-    /// Which VSpace currently maps this Frame, and at what address — `Unmap`'s
-    /// target, and what stops a Frame being mapped into two VSpaces (or twice
-    /// into the same one) at once. Phase 1 has no shared-frame IPC yet, so a
-    /// Frame has at most one mapping, full stop.
-    pub mapped_at: Option<(VSpaceId, usize)>,
+    /// Every VSpace currently mapping this Frame, and at what address —
+    /// `Unmap`'s target set. Phase 1 allowed at most one entry ever ("a Frame
+    /// has at most one mapping, full stop"); Phase 3
+    /// ([ADR-0022](../../lantern-rfcs/adr/0022-confined-service-model-and-call-transport.md)
+    /// Part 2) widens that to [`MAX_FRAME_MAPPINGS`] — the RFC-0019 shared
+    /// `Frame` needs exactly two, a runtime process and the one service it
+    /// talks to, both with a live RW mapping to the same physical page at
+    /// once. A slot is `None` when unused; `Map` fails with
+    /// `IllegalOperation` once every slot is `Some`.
+    pub mapped_at: [Option<(VSpaceId, usize)>; MAX_FRAME_MAPPINGS],
 }
 
 /// Phase 1 scheduling context ([ADR-0009](../../lantern-rfcs/adr/0009-phase1-scheduling-context-model.md)):
