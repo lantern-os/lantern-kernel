@@ -168,8 +168,50 @@ runs.
   the bug lives somewhere in the real trap-entry/exit or address-space-switch path this
   crate's host tests structurally cannot exercise. Not root-caused; worked around at the
   `lantern-boot` call site with extra tolerated round trips, not fixed here.
+  **A new, much more deterministic manifestation, found 2026-09-13 building
+  `lantern-boot-keystore-demo`** (a confined `lantern_crypto::Keystore`'s live
+  `request_key_access`+`deliver_grant_via_reply` grant round, then the granted client
+  using the badge to `Call` again): the client's **first** `Call` issued right after being
+  resumed via the *service's* `Reply` (`tag.extra_caps == 1`, a real capability transfer)
+  **never reaches the service at all — 100% reproducibly, not occasionally.** Diagnostic
+  instrumentation in the trap handler (`lantern-boot`, temporary, removed) directly
+  inspected kernel state across this exact trap and found: the transferred capability is
+  present and correct at the destination (right `EndpointId`, right badge, right
+  `Rights::WRITE | Rights::GRANT`); the target endpoint's queue is `Empty` (no
+  interference); `Scheduler::has_ready()` is `true`; no `SyscallError` is raised
+  (`tag`'s error flag stays clear, `mr0` unchanged from its input value) — and yet
+  **neither thread's `ThreadState` nor `scheduler.current` changes across the trap at
+  all**, as if `ipc::call`'s body never ran past its capability/tag resolution. A `dev`
+  profile build (debug assertions on) hit no panic either, including at
+  `ipc::call`'s `debug_assert!(switched, "has_ready() was checked immediately above")`.
+  Structurally the closest-precedent difference from `lantern-boot`'s own
+  IPC-latency-benchmark client (which *does* successfully `Call` again immediately after
+  being resumed via a Reply's `switch_to`, ~2000 times per run): this `Call` carries a
+  nonzero message-tag `label` (RFC-0019/ADR-0024's op code,
+  `lantern_abi::sys::call_with_label`) and targets a *freshly badge-transferred* CPtr
+  rather than a capability the loader pre-granted — neither individually ruled out as the
+  trigger. Not root-caused. Blocks `lantern-boot-keystore-demo`'s Phase 2 (the actual
+  RFC-0019 wire exchange) and, by the same shape, would block any confined service's
+  *second* client interaction generally — a real, higher-priority reason to finally
+  root-cause this class of bug, not just tolerate it via extra round trips.
 
 ## Next
+- **Root-cause the IPC round-trip-loss bug — now genuinely urgent, not just tolerated.**
+  The 2026-09-13 manifestation (above) is 100% reproducible and blocks real functionality
+  (`lantern-boot-keystore-demo`'s Phase 2), unlike the ~1-in-2000 rate the original
+  hello-service benchmark tolerates. Candidates not yet tried, in priority order given the
+  new evidence: (1) isolate whether a nonzero `MessageTag.label` on `Call` is the trigger
+  — build a minimal demo that issues a labelled `Call` immediately after being resumed via
+  a plain (no-capability-transfer) `Reply`, to separate that variable from "freshly
+  badge-transferred CPtr"; (2) QEMU GDB-stub single-stepping across the exact failing trap
+  (`-s -S`, `riscv64-unknown-elf-gdb`) to see directly whether `ipc::call` is entered at
+  all for this specific trap, since kernel-state inspection alone couldn't distinguish
+  "never entered" from "entered but every mutation silently no-op'd"; (3) compare the
+  `MessageTag` packing/unpacking specifically for a *nonzero* `label` through
+  `lantern-hal`'s riscv64 trap trampoline register save/restore path (a real repeat
+  offender — see this file's fixed trampoline-bug history above) — every prior use of a
+  nonzero label in this project (`CNodeInvoke`) has been a *fast, uninterrupted* call, not
+  one crossing a thread suspend/resume boundary.
 - The capability-derivation tree `Revoke`/proper `Delete` reclaim need — more pressing in
   Phase 3: [RFC-0018](../lantern-rfcs/rfcs/0018-confined-execution-port.md) (Accepted;
   [ADR-0022](../lantern-rfcs/adr/0022-confined-service-model-and-call-transport.md)/[ADR-0023](../lantern-rfcs/adr/0023-wasmtime-no-std-pulley-hosting.md))
