@@ -147,6 +147,16 @@ runs.
 - `Revoke` is cleanly refused (`IllegalOperation`), not implemented — needs a
   capability-derivation tree; `Delete` doesn't reclaim the underlying pooled object either
   (no refcounting yet).
+- **`MAX_FRAMES = 16` is a real, binding ceiling, confirmed the hard way (2026-09-13).**
+  `lantern-runtime/riscv64-probe`'s first Wasmtime+Pulley `riscv64` binary needed ~32
+  `FrameMega`s (a 64 MiB `.bss` arena alone) — more than double the *entire system's*
+  Frame budget, for one program. Not a tuning nuisance to relax casually if it recurs: a
+  future program that genuinely needs a large working set (a real, non-trivial Wasm guest;
+  a bigger content-addressed store) will hit this same wall, and raising `MAX_FRAMES`
+  grows every kernel build's static footprint, not just that one program's ceiling. Worked
+  around this time by shrinking the *program* instead (`lantern-boot/STATUS.md`'s
+  `wasm-probe-demo` entry) — a real fix (bigger Frame sizes, e.g. 1 GiB pages, or on-demand
+  `Untyped`→`Frame` retyping past a fixed pool) is real design work, not done here.
 - No idle thread: a blocking operation with no other ready thread refuses with an error
   (reusing `SyscallError::Timeout`, an imperfect semantic fit) rather than stranding the
   hart. The QEMU demo sidesteps this by construction (always ≥1 ready thread when either
