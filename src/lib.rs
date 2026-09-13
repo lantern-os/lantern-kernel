@@ -93,6 +93,17 @@ pub unsafe fn enter_first_thread(id: cap::TcbId) -> ! {
     // SAFETY: forwarded from this function's own contract — called once, before
     // any trap, by boot code that owns exclusive access at this point.
     let state = unsafe { state::kernel_state() };
+    // A thread this function is about to run directly may already be sitting
+    // in the ready queue — `admin::configure` (`TCBConfigure`) auto-enqueues
+    // any thread that just left `Inactive`, and this function doesn't go
+    // through `make_ready`/`block_current`'s own bookkeeping to undo that.
+    // Left alone, the thread would be both `current` *and* ready — the exact
+    // hazard `KernelState::switch_to`'s doc warns against: the first time it
+    // later blocks, `block_current` can pop this same stale entry right back
+    // off the queue and treat that as a completed switch, silently dropping
+    // whatever real switch should have happened instead. See
+    // `lantern-kernel/STATUS.md`'s "IPC round-trip loss" entry.
+    state.scheduler.remove_ready(id);
     state.scheduler.current = Some(id);
     let mut frame = lantern_hal::TrapFrame::zeroed();
     if let Some(tcb) = state.tcbs.get_mut(id.0 as usize) {

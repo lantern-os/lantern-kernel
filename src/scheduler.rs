@@ -22,6 +22,19 @@ impl Scheduler {
     pub fn has_ready(&self) -> bool {
         !self.ready.is_empty()
     }
+
+    /// Removes `id` from the ready queue if it's sitting there. Used wherever
+    /// a thread transitions to `Running` *without* going through
+    /// [`KernelState::block_current`]'s pop — currently only
+    /// [`crate::enter_first_thread`] — so it can never end up both `current`
+    /// and enqueued as ready at once. See that function's doc for why: a
+    /// freshly `TCBConfigure`d thread is auto-enqueued by
+    /// [`crate::admin::configure`] the moment it leaves `Inactive`, and
+    /// `enter_first_thread` doesn't go through `make_ready`/`block_current`'s
+    /// own bookkeeping to clear that.
+    pub(crate) fn remove_ready(&mut self, id: TcbId) {
+        self.ready.remove(id);
+    }
 }
 
 impl Default for Scheduler {

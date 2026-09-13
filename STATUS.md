@@ -157,61 +157,44 @@ runs.
   CNode* — that part is unchanged and still true. Cross-CNode placement is now possible via
   the separate `CopyCross` operation (RFC-0010, above), used by `lantern-boot/loader.rs`
   instead of its old direct pool write.
-- **IPC round-trip loss under real QEMU, not reproducible on host.** Found while building
-  `lantern-boot`'s IPC benchmark: the first `Call`/`block_current` a thread issues right
-  after a warm-up round trip occasionally never actually resumes the receiver, despite
-  `block_current` returning `true` and `scheduler.current` being set correctly — see
-  `lantern-boot/STATUS.md`'s "IPC round-trip loss" entry for the full investigation.
-  `syscall::tests::two_call_reply_round_trips_in_a_row_client_runs_first` reproduces the
-  identical dispatch sequence against portable `KernelState` (no real paging) and passes,
-  which is evidence this crate's own `ipc::call`/`block_current` logic is *not* the cause —
-  the bug lives somewhere in the real trap-entry/exit or address-space-switch path this
-  crate's host tests structurally cannot exercise. Not root-caused; worked around at the
-  `lantern-boot` call site with extra tolerated round trips, not fixed here.
-  **A new, much more deterministic manifestation, found 2026-09-13 building
-  `lantern-boot-keystore-demo`** (a confined `lantern_crypto::Keystore`'s live
-  `request_key_access`+`deliver_grant_via_reply` grant round, then the granted client
-  using the badge to `Call` again): the client's **first** `Call` issued right after being
-  resumed via the *service's* `Reply` (`tag.extra_caps == 1`, a real capability transfer)
-  **never reaches the service at all — 100% reproducibly, not occasionally.** Diagnostic
-  instrumentation in the trap handler (`lantern-boot`, temporary, removed) directly
-  inspected kernel state across this exact trap and found: the transferred capability is
-  present and correct at the destination (right `EndpointId`, right badge, right
-  `Rights::WRITE | Rights::GRANT`); the target endpoint's queue is `Empty` (no
-  interference); `Scheduler::has_ready()` is `true`; no `SyscallError` is raised
-  (`tag`'s error flag stays clear, `mr0` unchanged from its input value) — and yet
-  **neither thread's `ThreadState` nor `scheduler.current` changes across the trap at
-  all**, as if `ipc::call`'s body never ran past its capability/tag resolution. A `dev`
-  profile build (debug assertions on) hit no panic either, including at
-  `ipc::call`'s `debug_assert!(switched, "has_ready() was checked immediately above")`.
-  Structurally the closest-precedent difference from `lantern-boot`'s own
-  IPC-latency-benchmark client (which *does* successfully `Call` again immediately after
-  being resumed via a Reply's `switch_to`, ~2000 times per run): this `Call` carries a
-  nonzero message-tag `label` (RFC-0019/ADR-0024's op code,
-  `lantern_abi::sys::call_with_label`) and targets a *freshly badge-transferred* CPtr
-  rather than a capability the loader pre-granted — neither individually ruled out as the
-  trigger. Not root-caused. Blocks `lantern-boot-keystore-demo`'s Phase 2 (the actual
-  RFC-0019 wire exchange) and, by the same shape, would block any confined service's
-  *second* client interaction generally — a real, higher-priority reason to finally
-  root-cause this class of bug, not just tolerate it via extra round trips.
+- ~~**IPC round-trip loss under real QEMU, not reproducible on host.**~~ **ROOT-CAUSED
+  AND FIXED, 2026-09-13.** The bug (both the original ~1-in-2000 `lantern-boot` benchmark
+  manifestation and the 100%-reproducible one `lantern-boot-keystore-demo` found the same
+  day — same root cause, just different odds of landing on the exact failing trap) was a
+  genuine duplicate-ready-queue-entry hazard, exactly the one `KernelState::switch_to`'s
+  own doc comment already warned callers to avoid: **`admin::configure` (`TCBConfigure`)
+  auto-`make_ready`s any TCB the instant it leaves `ThreadState::Inactive`** (so every
+  program `lantern-boot`'s launcher configures — including whichever one it's about to
+  run first via `enter_first_thread` — lands in the ready queue), **and
+  `enter_first_thread` never removed its target from that queue** before setting it
+  `current` and jumping to it. That thread was then simultaneously "running" and "ready"
+  — the first time it later blocked (`KernelState::block_current`), it could pop *itself*
+  back off the ready queue's front, restore the `SavedContext` it had just that instant
+  saved, and return having done nothing: no thread switch, no error, `scheduler.current`
+  unchanged, `frame` bit-for-bit identical in and out. To the caller this looked exactly
+  like a "successful, instant" `Call`/`Send` that never actually reached the intended
+  receiver — silently dropping the real message. Confirmed via a temporary diagnostic
+  (`Scheduler`'s ready-queue front/length, printed before/after every trap by
+  `lantern-boot`'s own trap handler — since removed) that showed `ready_len == 3` at the
+  very first trap of `lantern-boot-keystore-demo` (should be 1: the launcher's explicit
+  `make_ready` call *and* `configure`'s own auto-enqueue both fire for the same
+  non-first thread, plus the first thread's own auto-enqueue from `configure` that
+  `enter_first_thread` never cleared) and traced the exact self-pop live. This also
+  fully explains why `hello-service`'s 2000-round-trip benchmark only ever lost *one*
+  message, always right after the warm-up round trip: the very same self-pop happens
+  there too (same structural position — the first `Call` right after a `Reply`'s
+  `switch_to`), but that benchmark discards its reply value unchecked, so the phantom
+  instant "success" just costs one silently-unmatched round trip rather than breaking
+  anything visibly, and the ready queue's surplus entry stabilizes into a harmless
+  constant +1 offset that never self-pops again for the rest of that run.
+  **Fix:** `Scheduler::remove_ready`/`ArrayQueue::remove` (new; 4 new unit tests) —
+  `enter_first_thread` now removes its target from the ready queue (if present) before
+  making it current, restoring the invariant `switch_to`'s doc already promised.
+  QEMU-verified: `lantern-boot-keystore-demo`'s Phase 2 (previously 4/4 reproducible
+  FAILURE) now completes 4/4 `Signal'd SUCCESS`; `hello-service`, `broker-demo`,
+  `frame-demo` all regression-clean. 63 kernel tests green (59 + 4 new).
 
 ## Next
-- **Root-cause the IPC round-trip-loss bug — now genuinely urgent, not just tolerated.**
-  The 2026-09-13 manifestation (above) is 100% reproducible and blocks real functionality
-  (`lantern-boot-keystore-demo`'s Phase 2), unlike the ~1-in-2000 rate the original
-  hello-service benchmark tolerates. Candidates not yet tried, in priority order given the
-  new evidence: (1) isolate whether a nonzero `MessageTag.label` on `Call` is the trigger
-  — build a minimal demo that issues a labelled `Call` immediately after being resumed via
-  a plain (no-capability-transfer) `Reply`, to separate that variable from "freshly
-  badge-transferred CPtr"; (2) QEMU GDB-stub single-stepping across the exact failing trap
-  (`-s -S`, `riscv64-unknown-elf-gdb`) to see directly whether `ipc::call` is entered at
-  all for this specific trap, since kernel-state inspection alone couldn't distinguish
-  "never entered" from "entered but every mutation silently no-op'd"; (3) compare the
-  `MessageTag` packing/unpacking specifically for a *nonzero* `label` through
-  `lantern-hal`'s riscv64 trap trampoline register save/restore path (a real repeat
-  offender — see this file's fixed trampoline-bug history above) — every prior use of a
-  nonzero label in this project (`CNodeInvoke`) has been a *fast, uninterrupted* call, not
-  one crossing a thread suspend/resume boundary.
 - The capability-derivation tree `Revoke`/proper `Delete` reclaim need — more pressing in
   Phase 3: [RFC-0018](../lantern-rfcs/rfcs/0018-confined-execution-port.md) (Accepted;
   [ADR-0022](../lantern-rfcs/adr/0022-confined-service-model-and-call-transport.md)/[ADR-0023](../lantern-rfcs/adr/0023-wasmtime-no-std-pulley-hosting.md))

@@ -52,6 +52,33 @@ impl<T: Copy, const N: usize> ArrayQueue<T, N> {
     }
 }
 
+impl<T: Copy + PartialEq, const N: usize> ArrayQueue<T, N> {
+    /// Removes the first occurrence of `value`, preserving the relative order
+    /// of everything else. Returns whether it was found.
+    ///
+    /// `head` never moves — surviving elements are rewritten starting there as
+    /// they're found, so the write cursor never overtakes the (always
+    /// further-ahead, or equal) read cursor within this same pass.
+    pub fn remove(&mut self, value: T) -> bool {
+        let mut found = false;
+        let mut write = self.head;
+        let mut new_len = 0;
+        for i in 0..self.len {
+            let idx = (self.head + i) % N;
+            let item = self.items[idx].take();
+            if !found && item == Some(value) {
+                found = true;
+                continue;
+            }
+            self.items[write] = item;
+            write = (write + 1) % N;
+            new_len += 1;
+        }
+        self.len = new_len;
+        found
+    }
+}
+
 impl<T: Copy, const N: usize> Default for ArrayQueue<T, N> {
     fn default() -> Self {
         Self::new()
@@ -107,5 +134,54 @@ mod tests {
         q.push_back(3);
         assert_eq!(q.pop_front(), Some(2));
         assert_eq!(q.pop_front(), Some(3));
+    }
+
+    #[test]
+    fn remove_drops_the_named_entry_and_preserves_order() {
+        let mut q: ArrayQueue<u32, 4> = ArrayQueue::new();
+        q.push_back(1);
+        q.push_back(2);
+        q.push_back(3);
+        assert!(q.remove(2));
+        assert_eq!(q.pop_front(), Some(1));
+        assert_eq!(q.pop_front(), Some(3));
+        assert_eq!(q.pop_front(), None);
+    }
+
+    #[test]
+    fn remove_reports_absence_without_touching_the_queue() {
+        let mut q: ArrayQueue<u32, 4> = ArrayQueue::new();
+        q.push_back(1);
+        q.push_back(2);
+        assert!(!q.remove(99));
+        assert_eq!(q.pop_front(), Some(1));
+        assert_eq!(q.pop_front(), Some(2));
+    }
+
+    #[test]
+    fn remove_only_drops_the_first_occurrence() {
+        let mut q: ArrayQueue<u32, 4> = ArrayQueue::new();
+        q.push_back(1);
+        q.push_back(1);
+        q.push_back(2);
+        assert!(q.remove(1));
+        assert_eq!(q.pop_front(), Some(1));
+        assert_eq!(q.pop_front(), Some(2));
+        assert_eq!(q.pop_front(), None);
+    }
+
+    #[test]
+    fn remove_works_after_the_backing_array_has_wrapped() {
+        let mut q: ArrayQueue<u32, 3> = ArrayQueue::new();
+        q.push_back(1);
+        q.push_back(2);
+        q.pop_front();
+        q.push_back(3);
+        q.push_back(4);
+        // Backing layout now wraps: head sits mid-array, [2, 3, 4] logically.
+        assert!(q.remove(3));
+        assert_eq!(q.pop_front(), Some(2));
+        assert_eq!(q.pop_front(), Some(4));
+        assert_eq!(q.pop_front(), None);
     }
 }
