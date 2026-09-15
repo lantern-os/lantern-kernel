@@ -15,6 +15,15 @@ pub const MAX_VSPACES: usize = 4;
 /// linked binary's segments plus a stack, at megapage granularity
 /// (`lantern-boot/STATUS.md`) — a handful of 2 MiB Frames, not hundreds.
 pub const MAX_FRAMES: usize = 16;
+/// Kernel-owned page tables (`crate::object::KernelPageTables`) — `VSpace`
+/// roots (bounded by [`MAX_VSPACES`]) plus the L1/L0 branch pages
+/// `FrameInvoke::Map` creates on demand, one 4 KiB page each. Generous for a
+/// handful of loaded programs each touching a handful of distinct 1 GiB
+/// (Sv39 L2) regions, not tuned. This memory is embedded directly in
+/// `KernelState` (kernel `.bss`) — keep it well clear of the 2 MiB the
+/// kernel image's own linker script (`lantern-boot/linker.ld`) asserts the
+/// whole image must fit within.
+pub const MAX_KERNEL_PAGE_TABLES: usize = 32;
 
 /// Capacity of a single (Phase 1: flat, single-level) CNode, per RFC-0005's CSpace
 /// simplification.

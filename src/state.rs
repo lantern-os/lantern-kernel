@@ -20,7 +20,8 @@ use crate::limits::{
     MAX_UNTYPEDS, MAX_VSPACES,
 };
 use crate::object::{
-    Endpoint, Frame, Notification, SavedContext, SchedulingContext, Tcb, ThreadState, Untyped, VSpace,
+    Endpoint, Frame, KernelPageTables, Notification, SavedContext, SchedulingContext, Tcb, ThreadState,
+    Untyped, VSpace,
 };
 use crate::pool::Pool;
 use crate::scheduler::Scheduler;
@@ -36,6 +37,11 @@ pub struct KernelState {
     pub vspaces: Pool<VSpace, MAX_VSPACES>,
     /// RFC-0008/ADR-0012.
     pub frames: Pool<Frame, MAX_FRAMES>,
+    /// Real physical memory for `VSpace` roots and `FrameInvoke::Map`'s
+    /// on-demand branch pages — see [`KernelPageTables`]'s own doc for why
+    /// these can't come from the general-memory `Untyped` range `frames`
+    /// above draws from.
+    pub kernel_page_tables: KernelPageTables,
     pub scheduler: Scheduler,
 }
 
@@ -50,6 +56,7 @@ impl KernelState {
             sched_contexts: Pool::new(),
             vspaces: Pool::new(),
             frames: Pool::new(),
+            kernel_page_tables: KernelPageTables::new(),
             scheduler: Scheduler::new(),
         }
     }

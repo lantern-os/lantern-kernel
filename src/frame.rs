@@ -108,41 +108,35 @@ fn map(
 
     let vspace = state.vspaces.get(vspace_id.0 as usize).ok_or(SyscallError::InvalidCapability)?;
     let root = vspace.root as *mut lantern_hal::Riscv64PageTable;
-    let source = vspace.source;
 
     // SAFETY: `root` is a valid Sv39 root page table — every VSpace was built by
     // `admin::untyped_retype`'s `ObjectType::VSpace` arm, which always produces
-    // one (a zeroed, page-aligned physical page from a real memory-backed
-    // Untyped). `translate` only reads.
+    // one (a zeroed, page-aligned physical page from `KernelPageTables`).
+    // `translate` only reads.
     if unsafe { lantern_hal::riscv64_translate(root, vaddr) }.is_some() {
         return Err(SyscallError::IllegalOperation);
     }
 
     // `map`/`map_megapage`'s allocator closures are infallible by contract (they
-    // always return a page, never `None`) — but the Untyped they'd allocate an
-    // intermediate branch table from *can* be exhausted, which must fail
-    // gracefully (ADR-0008: "no syscall panics on caller-supplied input"), not
-    // panic inside the closure. Pre-allocating every page either walk could
+    // always return a page, never `None`) — but `KernelPageTables` they'd
+    // allocate an intermediate branch table from *can* be exhausted, which must
+    // fail gracefully (ADR-0008: "no syscall panics on caller-supplied input"),
+    // not panic inside the closure. Pre-allocating every page either walk could
     // *possibly* need — up to two (L1 and L0) for `map`'s full 3-level walk, up
     // to one (L1 only) for `map_megapage` — before ever calling either, turns
     // that failure into an ordinary `NotEnoughMemory` return, at the cost of
     // sometimes bumping a page the walk turns out not to need (a target branch
     // was already valid from an earlier `Map` sharing the same region). Wasted,
-    // never reused (no reclaim, same as every other Untyped bump —
-    // `crate::object::Untyped`'s doc) — acceptable for a handful of Phase 1
-    // loader mappings, not a real memory budget concern yet.
+    // never reused (no reclaim, same as every other bump discipline in this
+    // project — `crate::object::KernelPageTables`'s doc) — acceptable for a
+    // handful of Phase 1 loader mappings, not a real memory budget concern yet.
     let max_new_tables = match size {
         FrameSize::Small => 2,
         FrameSize::Mega => 1,
     };
     let mut spares = [0usize; 2];
-    {
-        let untyped = state.untypeds.get_mut(source.0 as usize).ok_or(SyscallError::InvalidCapability)?;
-        for slot in spares.iter_mut().take(max_new_tables) {
-            *slot = untyped
-                .bump(lantern_hal::RISCV64_PAGE_SIZE, lantern_hal::RISCV64_PAGE_SIZE)
-                .ok_or(SyscallError::NotEnoughMemory)?;
-        }
+    for slot in spares.iter_mut().take(max_new_tables) {
+        *slot = state.kernel_page_tables.alloc().ok_or(SyscallError::NotEnoughMemory)?;
     }
     let mut next_spare = 0usize;
     let mut alloc = move || {
@@ -152,8 +146,8 @@ fn map(
     };
 
     // SAFETY: `root` as above; `alloc` returns a distinct fresh page per call (up
-    // to `max_new_tables` calls, exactly what each walk can possibly make) — this
-    // Untyped's bump pointer never repeats, per `Untyped::bump`'s own contract.
+    // to `max_new_tables` calls, exactly what each walk can possibly make) —
+    // `KernelPageTables`'s bump pointer never repeats, per its own contract.
     match size {
         FrameSize::Small => unsafe {
             lantern_hal::riscv64_map_page(root, vaddr, paddr, perms.to_pte_flags(), &mut alloc)

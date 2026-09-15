@@ -2,12 +2,16 @@
 //!
 //! Both are real, working implementations. `UntypedRetype` carves
 //! `CNode`/`Endpoint`/`Notification`/`Tcb`/`SchedContext` from a plain count-based
-//! budget (still no general physical memory map — `lantern-kernel/STATUS.md`), but
-//! `VSpace`/`FrameSmall`/`FrameMega` from a *real* physical bump range a source
-//! Untyped may additionally carry (RFC-0008/ADR-0012, `crate::object::Untyped`'s
-//! own doc). `TCBConfigure` can now set a VSpace root, via a real capability
-//! (same RFC) — the "no HAL paging support yet" gap this comment used to describe
-//! is what that RFC closed.
+//! budget (still no general physical memory map — `lantern-kernel/STATUS.md`), and
+//! `FrameSmall`/`FrameMega` from a *real* physical bump range a source Untyped may
+//! additionally carry (RFC-0008/ADR-0012, `crate::object::Untyped`'s own doc).
+//! `VSpace` used to come from that same source-Untyped range too, but now comes
+//! from the kernel's own always-visible page-table arena instead
+//! (`crate::object::KernelPageTables`'s doc has the full story — a real,
+//! previously-unexercised bug this closes) — the source Untyped's *count* budget
+//! still gates it, only the physical backing moved. `TCBConfigure` can now set a
+//! VSpace root, via a real capability (same RFC) — the "no HAL paging support yet"
+//! gap this comment used to describe is what that RFC closed.
 
 use lantern_hal::TrapFrame;
 
@@ -87,11 +91,11 @@ pub fn untyped_retype(
             Capability::SchedContext { id: SchedContextId(idx as u16), rights: Rights::ALL }
         }
         ObjectType::VSpace => {
-            let untyped = state.untypeds.get_mut(untyped_id.0 as usize).expect("checked above");
-            let root = untyped
-                .bump(lantern_hal::RISCV64_PAGE_SIZE, lantern_hal::RISCV64_PAGE_SIZE)
-                .ok_or(SyscallError::NotEnoughMemory)?;
-            let idx = state.vspaces.alloc(VSpace { root, source: untyped_id }).ok_or(SyscallError::NotEnoughMemory)?;
+            // From the kernel's own page-table arena, not `untyped`'s memory
+            // range — see `crate::object::KernelPageTables`'s doc. `untyped`'s
+            // count budget (below, unconditionally) still gates this.
+            let root = state.kernel_page_tables.alloc().ok_or(SyscallError::NotEnoughMemory)?;
+            let idx = state.vspaces.alloc(VSpace { root }).ok_or(SyscallError::NotEnoughMemory)?;
             Capability::VSpace { id: VSpaceId(idx as u16), rights: Rights::ALL }
         }
         ObjectType::FrameSmall | ObjectType::FrameMega => {
@@ -321,6 +325,12 @@ mod tests {
 
     #[test]
     fn retype_vspace_from_a_memory_backed_untyped() {
+        // `root` no longer comes from `arena` at all -- it comes from the
+        // kernel's own `KernelPageTables` arena regardless of whether the
+        // source Untyped happens to be memory-backed (see that type's doc).
+        // This test still uses a memory-backed Untyped to show that case
+        // keeps working exactly like a plain count-based one does (the next
+        // test) -- only the *count* budget is consulted for VSpace now.
         let mut arena = TestArena([0; 64 * 1024]);
         let (mut state, tcb, untyped_cptr, dest) = setup_with_memory_backed_untyped(2, &mut arena);
         let mut frame = frame_for(untyped_cptr, ObjectType::VSpace as usize, dest);
@@ -332,7 +342,10 @@ mod tests {
         assert_eq!(rights, Rights::ALL);
         let vspace = state.vspaces.get(id.0 as usize).unwrap();
         let base = &arena as *const TestArena as usize;
-        assert!(vspace.root >= base && vspace.root < base + core::mem::size_of::<TestArena>());
+        assert!(
+            vspace.root < base || vspace.root >= base + core::mem::size_of::<TestArena>(),
+            "the VSpace root must come from the kernel's own page-table arena, not the source Untyped's memory"
+        );
         assert_eq!(vspace.root % lantern_hal::RISCV64_PAGE_SIZE, 0);
         assert_eq!(state.untypeds.get(0).unwrap().remaining, 1);
     }
@@ -391,15 +404,24 @@ mod tests {
     }
 
     #[test]
-    fn retype_vspace_without_real_memory_backing_fails() {
+    fn retype_vspace_succeeds_without_real_memory_backing() {
         // `setup_with_untyped` (not the `_memory_backed` variant) has no `memory`
-        // range at all — VSpace/Frame retype can't hand back a real address.
+        // range at all. VSpace retype used to require one (an earlier revision
+        // of this test, `retype_vspace_without_real_memory_backing_fails`,
+        // asserted exactly that) -- it no longer does, now that the root table
+        // comes from the kernel's own always-visible `KernelPageTables` arena
+        // instead of the source Untyped's memory (see that type's doc for the
+        // real bug this fixes). Only the count budget still gates VSpace.
         let (mut state, tcb, untyped_cptr, dest) = setup_with_untyped(2);
         let mut frame = frame_for(untyped_cptr, ObjectType::VSpace as usize, dest);
-        assert_eq!(
-            untyped_retype(&mut state, tcb, untyped_cptr, &mut frame),
-            Err(SyscallError::NotEnoughMemory)
-        );
+        untyped_retype(&mut state, tcb, untyped_cptr, &mut frame).unwrap();
+
+        let Some(Capability::VSpace { id, rights }) = state.cnodes.get(0).unwrap().get(dest) else {
+            panic!("expected a VSpace capability");
+        };
+        assert_eq!(rights, Rights::ALL);
+        assert_eq!(state.vspaces.get(id.0 as usize).unwrap().root % lantern_hal::RISCV64_PAGE_SIZE, 0);
+        assert_eq!(state.untypeds.get(0).unwrap().remaining, 1);
     }
 
     #[test]

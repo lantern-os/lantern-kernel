@@ -5,7 +5,7 @@
 
 use lantern_hal::{Hal, Hardware, MessageTag, TrapFrame, MR_COUNT};
 
-use crate::cap::{Capability, CNodeId, CPtr, NotificationId, SchedContextId, TcbId, UntypedId, VSpaceId};
+use crate::cap::{Capability, CNodeId, CPtr, NotificationId, SchedContextId, TcbId, VSpaceId};
 use crate::queue::ArrayQueue;
 
 /// Must match [`lantern_hal`]'s `TrapFrame::raw` word count. Not exported as a
@@ -246,17 +246,18 @@ impl Default for Notification {
 /// need a real physical address (they live in the kernel's own pools, not
 /// user-addressable memory).
 ///
-/// **`VSpace`/`Frame` are different: they *name* real physical memory** (an Sv39
-/// root page table; a page a thread can map), so retyping one needs an actual
-/// address, not just a decremented count. `memory`, when `Some`, is a real
-/// physical bump range `lantern-boot` seeds at boot from its own `pmm` allocator
-/// (the only real physical-memory source that exists today) — see
+/// **`Frame` is different: it *names* real physical memory** (a page a thread
+/// can map), so retyping one needs an actual address, not just a decremented
+/// count. `memory`, when `Some`, is a real physical bump range `lantern-boot`
+/// seeds at boot from its own `pmm` allocator (the only real physical-memory
+/// source that exists today) — see
 /// [RFC-0008](../../lantern-rfcs/rfcs/0008-vspace-frame-capabilities-and-elf-loader.md)/
 /// [ADR-0012](../../lantern-rfcs/adr/0012-vspace-frame-capabilities-and-elf-loader.md).
 /// This is a narrow, additive change to *specific* Untyped instances, not a
 /// general physical-memory-discovery subsystem — most Untypeds (e.g. the ones
 /// today's tests construct) still have `memory: None` and can retype anything
-/// except `VSpace`/`Frame*`.
+/// except `Frame*`. (`VSpace` *used to* need this too — it no longer does; see
+/// [`KernelPageTables`]'s doc.)
 #[derive(Clone, Copy, Debug)]
 pub struct Untyped {
     pub remaining: usize,
@@ -313,15 +314,86 @@ impl FrameSize {
 }
 
 /// An address space: one Sv39 root page table. `root` is a real physical
-/// address, from the owning Untyped's `memory` range (RFC-0008/ADR-0012).
+/// address — from [`KernelPageTables`], not a caller-chosen Untyped's own
+/// `memory` range (RFC-0008/ADR-0012 originally put it there; see
+/// [`KernelPageTables`]'s doc for why that changed).
 #[derive(Clone, Copy, Debug)]
 pub struct VSpace {
     pub root: usize,
-    /// Which Untyped this VSpace's root table (and any L1 tables `FrameInvoke`
-    /// `Map` needs to create on demand) were bump-allocated from — `Map` reuses
-    /// it rather than taking a separate "which Untyped to allocate from"
-    /// argument every caller would otherwise have to supply.
-    pub(crate) source: UntypedId,
+}
+
+/// Real, page-aligned physical memory for kernel-owned page tables — `VSpace`
+/// roots (above), and the L1/L0 branch pages [`crate::frame`]'s `Map` creates
+/// on demand — embedded directly in [`crate::state::KernelState`] (kernel
+/// `.bss`), not the general-memory `Untyped` range `Frame` **data** pages
+/// come from.
+///
+/// **Why this exists.** `lantern-kernel`'s page-table code (`frame::map`/
+/// `unmap`) and `lantern-boot`'s `launch::map_kernel_shared` both dereference
+/// `VSpace::root`/branch-page physical addresses directly, as raw pointers.
+/// That's fine when the launcher calls them as plain Rust functions
+/// pre-`enter_first_thread`, while `satp` is still Bare (no translation) —
+/// every physical address is directly addressable then. But RISC-V traps
+/// don't switch page tables, so once *any* program's own paging is active,
+/// S-mode code servicing a real `ecall` keeps running under *that* program's
+/// own table — which had no mapping for physical memory bump-allocated from
+/// the general-memory `Untyped` (a range loaded programs' own virtual
+/// addresses also numerically overlap, e.g. a service linked at
+/// `BASE_ADDRESS = 0x8400_0000`). A confined program's own
+/// `FrameInvoke::Map` — RFC-0018 Part 3's self-mapping arena
+/// (`ArenaGrant`) — is the first thing that ever exercised this for real: it
+/// hung on an unresolvable load page fault reading its own VSpace's root
+/// table (diagnosed live under QEMU via the monitor — identical
+/// PC/`scause`/`stval` across repeated `info registers` reads, pinned at the
+/// VSpace root's own physical page). Kernel-owned page tables living inside
+/// the kernel's own image sidestep the problem entirely: that memory is
+/// already inside the one megapage `map_kernel_shared` maps S-mode-only into
+/// *every* loaded program's VSpace, so it's always visible regardless of
+/// which table is currently active — no offset math, no relinking every
+/// program's own address layout, no `lantern-hal` changes.
+///
+/// Frame **data** pages (a program's stack/heap/ELF image/Wasm arena) are
+/// unaffected and keep coming from the general-memory `Untyped` — the kernel
+/// never dereferences their contents directly, only their metadata (`paddr`,
+/// `mapped_at`), which already lives in the always-visible `KernelState`.
+///
+/// Sized by [`crate::limits::MAX_KERNEL_PAGE_TABLES`] — generous for a Phase
+/// 1/3 boot image (a handful of loaded programs, each needing one VSpace root
+/// plus at most a couple of branch tables), not tuned, same philosophy as
+/// every other fixed-capacity pool in `crate::limits`.
+#[repr(C, align(4096))]
+pub struct KernelPageTables {
+    bytes: [u8; crate::limits::MAX_KERNEL_PAGE_TABLES * lantern_hal::RISCV64_PAGE_SIZE],
+    next: usize,
+}
+
+impl KernelPageTables {
+    pub const fn new() -> Self {
+        Self { bytes: [0; crate::limits::MAX_KERNEL_PAGE_TABLES * lantern_hal::RISCV64_PAGE_SIZE], next: 0 }
+    }
+
+    /// Bump-allocates one fresh, zeroed, page-aligned physical page — a
+    /// page-table level's "all entries invalid" state is the all-zero byte
+    /// pattern, so the zero-initialized `bytes` array is exactly the
+    /// contract every caller (`admin::untyped_retype`'s `VSpace` arm,
+    /// `frame::map`'s branch-page spares) needs. Never reclaims — matches
+    /// every other bump discipline in this project (`Untyped::bump`,
+    /// `lantern-abi`'s `BumpAlloc`).
+    pub fn alloc(&mut self) -> Option<usize> {
+        let size = lantern_hal::RISCV64_PAGE_SIZE;
+        if self.next.checked_add(size)? > self.bytes.len() {
+            return None;
+        }
+        let addr = self.bytes.as_mut_ptr() as usize + self.next;
+        self.next += size;
+        Some(addr)
+    }
+}
+
+impl Default for KernelPageTables {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// The most VSpaces one [`Frame`] may be mapped into at once —

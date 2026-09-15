@@ -203,6 +203,43 @@ runs.
   QEMU-verified: `lantern-boot-keystore-demo`'s Phase 2 (previously 4/4 reproducible
   FAILURE) now completes 4/4 `Signal'd SUCCESS`; `hello-service`, `broker-demo`,
   `frame-demo` all regression-clean. 63 kernel tests green (59 + 4 new).
+- **`KernelPageTables` — `VSpace` roots and `FrameInvoke::Map`'s on-demand branch pages
+  moved off the general-memory `Untyped` range and into a new, kernel-owned static arena
+  (2026-09-15, `object.rs`)** — fixes a real, previously-unexercised bug found building
+  RFC-0018 Part 3's confined-program self-mapping (`lantern-boot`'s `ArenaGrant`):
+  `frame::map`/`unmap` dereference `VSpace::root`/branch-page physical addresses directly,
+  which only ever worked because every prior caller was the launcher, invoking them as
+  plain Rust functions pre-`enter_first_thread` while `satp` is still Bare (no
+  translation — every physical address directly addressable). RISC-V traps don't switch
+  page tables, so once any program's own paging is active, S-mode code servicing a real
+  `ecall` keeps running under *that* program's own table — which had no mapping for
+  physical memory bump-allocated from the general-memory `Untyped` (a range loaded
+  programs' own virtual addresses also numerically overlap). `ArenaGrant`'s self-mapping
+  is the first thing that ever issued `FrameInvoke::Map` as a real `ecall` after paging is
+  active, and it hung on an unresolvable load page fault reading its own VSpace's root
+  table — diagnosed live under QEMU via the monitor (`info registers`, identical
+  PC/`scause`(load page fault)/`stval` across two reads, 2s apart, pinned at the VSpace
+  root's own physical page). **Fix:** `object::KernelPageTables`, a small fixed-size
+  (`limits::MAX_KERNEL_PAGE_TABLES = 32`) page-table arena embedded directly in
+  `KernelState` (kernel `.bss`) — already inside the one megapage `lantern-boot`'s
+  `map_kernel_shared` maps S-mode-only into *every* loaded VSpace, so always visible
+  regardless of which table is active. `admin::untyped_retype`'s `VSpace` arm and
+  `frame::map`'s branch-page spares both source from it now instead of a caller-supplied
+  Untyped; `VSpace` dropped its `source: UntypedId` field entirely (no longer needed).
+  `VSpace` retyping no longer requires a memory-backed source Untyped (only Frame data
+  still does) — two `admin.rs` tests updated/renamed to match (one inverted from "fails
+  without real memory backing" to "succeeds without it"). Zero `lantern-hal` changes, zero
+  relinking of any service crate's `linker.ld` — confined entirely to `lantern-kernel`
+  (`object.rs`/`admin.rs`/`frame.rs`/`state.rs`/`limits.rs`) plus `lantern-boot`'s
+  `map_kernel_shared` (which dropped its now-unused `root`/`untyped_cptr` parameters). All
+  63 kernel tests green; `lantern-boot`'s six demos regression-clean; `wasm-probe-demo`'s
+  `ArenaGrant` now genuinely self-maps via real `FrameInvoke::Map`/`Unmap`, 4/4 reproducible
+  `Signal'd SUCCESS` — see `lantern-boot/STATUS.md` and `lantern-runtime/STATUS.md` for the
+  cross-crate writeup. An earlier fix attempt (identity-mapping the whole general-memory
+  range S-mode-only in `lantern-boot`) was tried and reverted first — it collided with
+  loaded programs' own virtual addresses numerically overlapping general *physical* memory
+  (e.g. a service linked at `BASE_ADDRESS = 0x8400_0000`); moving the *backing* rather than
+  relinking every program's own layout avoided that collision entirely.
 
 ## Next
 - The capability-derivation tree `Revoke`/proper `Delete` reclaim need — more pressing in
