@@ -113,8 +113,24 @@ impl KernelState {
 
     /// Re-enqueues `id` as ready. Used both to admit a newly configured thread and
     /// to wake a blocked one.
+    ///
+    /// **Idempotent for a thread that's already `Ready`.** This is the only place a
+    /// thread becomes `Ready`, so `Ready` ⇔ "in the ready queue exactly once" — and a
+    /// second push would break that. It used to happen: `admin::configure` already
+    /// enqueues every newly configured thread, and `lantern-boot`'s multi-program
+    /// loaders then called `make_ready` on their services again. The stale duplicate
+    /// sat in the queue until long after the service had run and blocked in `Recv`;
+    /// popping it later "resumed" a thread that was still blocked, which then handled
+    /// a phantom request, overwrote its shared `Frame`, and left a second waiter on its
+    /// endpoint. Whether that corrupted anything visible depended on the exact
+    /// interleaving — found by `lantern-boot`'s runtime-fs demo, where one extra
+    /// (harmless) READ before a WRITE turned the store's later decrypt into `FAILED`.
+    /// Same family as `enter_first_thread`'s `remove_ready` fix, for every other thread.
     pub fn make_ready(&mut self, id: TcbId) {
         if let Some(tcb) = self.tcbs.get_mut(id.0 as usize) {
+            if tcb.state == ThreadState::Ready {
+                return;
+            }
             tcb.state = ThreadState::Ready;
         }
         self.scheduler.ready.push_back(id);
@@ -202,6 +218,24 @@ mod tests {
         if let Some(tcb) = state.tcbs.get_mut(id.0 as usize) {
             tcb.state = ThreadState::Running;
         }
+    }
+
+    #[test]
+    fn make_ready_twice_enqueues_once() {
+        // The configure-then-loader double `make_ready` (see `make_ready`'s doc): a
+        // stale second entry must never exist to be popped after the thread blocks.
+        let mut state = KernelState::new();
+        let a = spawn_ready(&mut state);
+        state.make_ready(a);
+
+        assert_eq!(state.scheduler.ready.pop_front(), Some(a));
+        assert!(!state.scheduler.has_ready(), "a second make_ready must not have queued a duplicate");
+
+        // Once it has left `Ready` (popped to run, here), waking it again enqueues it
+        // normally — idempotence is only for an already-queued thread.
+        state.tcbs.get_mut(a.0 as usize).unwrap().state = ThreadState::Running;
+        state.make_ready(a);
+        assert_eq!(state.scheduler.ready.pop_front(), Some(a));
     }
 
     #[test]

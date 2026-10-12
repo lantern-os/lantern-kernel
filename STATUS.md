@@ -123,6 +123,21 @@
   across the two mappers are each service's own copy-in-before-validate discipline,
   RFC-0019, not a kernel-enforced property).
 
+- **Fixed: a thread could be in the ready queue twice, and the stale entry resumed it
+  while it was still blocked** (2026-10-12). `admin::configure` already enqueues every
+  newly configured thread; `lantern-boot`'s multi-program loaders then called
+  `make_ready` on their services again. The duplicate outlived the service's first run,
+  and when it was popped later, `block_current` restored a thread that was blocked in
+  `Recv`. That thread then handled a phantom request, overwrote its shared `Frame`, and
+  left a second waiter on its endpoint. Whether anything visibly broke depended on the
+  exact interleaving: `lantern-boot-runtime-fs-demo` failed only when its guest read an
+  empty file before writing (the store's decrypt came back `FAILED`), and passed with the
+  loader's redundant calls removed. Fixed at the invariant: `make_ready` is a no-op for an
+  already-`Ready` thread (it's the only place a thread becomes `Ready`, so `Ready` ⇔ "queued
+  exactly once"). Same family as round 3's `enter_first_thread`/`remove_ready` fix, which
+  only covered the first-run thread. New test `make_ready_twice_enqueues_once`; 64 tests
+  green; all eight `lantern-boot` demos pass under QEMU with the loaders unchanged.
+
 ## Validated under real QEMU
 [`lantern-boot`](../lantern-boot)'s loader (`src/loader.rs`, RFC-0008) drives a full
 `Call`→`Recv`→`Reply` round trip through real `riscv64` traps under `qemu-system-riscv64`,
