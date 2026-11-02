@@ -162,7 +162,14 @@ runs.
 - `Revoke` is cleanly refused (`IllegalOperation`), not implemented — needs a
   capability-derivation tree; `Delete` doesn't reclaim the underlying pooled object either
   (no refcounting yet).
-- **`MAX_FRAMES = 16` is a real, binding ceiling, confirmed the hard way (2026-09-13).**
+- **Limits raised, and sized from data, for RFC-0020 (2026-11-02).** `MAX_FRAMES` 24, `MAX_CNODES` 6,
+  `MAX_VSPACES` 5, `CNODE_SLOTS` 56, sized from `lantern-boot-runtime-fs-demo` plus one small service
+  (see `src/limits.rs`). Total cost about 4 KiB of `.bss`, which corrects the note below: the expensive
+  object is the Frame's memory, not its pool entry. The earlier values were placeholders. **Fixed a page
+  leak:** `FrameInvoke::Map` allocated spare branch tables before every walk and never returned the
+  unused ones, so every map cost a 4 KiB page, including a confined runtime's repeated Wasmtime `mmap`s.
+  It now returns them (new `KernelPageTables::release_last`, new test, 65 tests).
+- **`MAX_FRAMES = 16` was a real, binding ceiling, confirmed the hard way (2026-09-13).**
   `lantern-runtime/riscv64-probe`'s first Wasmtime+Pulley `riscv64` binary needed ~32
   `FrameMega`s (a 64 MiB `.bss` arena alone) — more than double the *entire system's*
   Frame budget, for one program. Not a tuning nuisance to relax casually if it recurs: a

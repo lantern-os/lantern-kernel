@@ -372,12 +372,19 @@ impl KernelPageTables {
         Self { bytes: [0; crate::limits::MAX_KERNEL_PAGE_TABLES * lantern_hal::RISCV64_PAGE_SIZE], next: 0 }
     }
 
+    /// Gives back the `count` most recent [`Self::alloc`]s. The caller must not have
+    /// written to them, which keeps `alloc`'s zeroed-page contract true, and must still
+    /// be the most recent allocator.
+    pub fn release_last(&mut self, count: usize) {
+        self.next -= count * lantern_hal::RISCV64_PAGE_SIZE;
+    }
+
     /// Bump-allocates one fresh, zeroed, page-aligned physical page — a
     /// page-table level's "all entries invalid" state is the all-zero byte
     /// pattern, so the zero-initialized `bytes` array is exactly the
     /// contract every caller (`admin::untyped_retype`'s `VSpace` arm,
-    /// `frame::map`'s branch-page spares) needs. Never reclaims — matches
-    /// every other bump discipline in this project (`Untyped::bump`,
+    /// `frame::map`'s branch-page spares) needs. Never reclaims a page in use —
+    /// matches every other bump discipline in this project (`Untyped::bump`,
     /// `lantern-abi`'s `BumpAlloc`).
     pub fn alloc(&mut self) -> Option<usize> {
         let size = lantern_hal::RISCV64_PAGE_SIZE;

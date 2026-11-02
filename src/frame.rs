@@ -124,12 +124,10 @@ fn map(
     // not panic inside the closure. Pre-allocating every page either walk could
     // *possibly* need — up to two (L1 and L0) for `map`'s full 3-level walk, up
     // to one (L1 only) for `map_megapage` — before ever calling either, turns
-    // that failure into an ordinary `NotEnoughMemory` return, at the cost of
-    // sometimes bumping a page the walk turns out not to need (a target branch
-    // was already valid from an earlier `Map` sharing the same region). Wasted,
-    // never reused (no reclaim, same as every other bump discipline in this
-    // project — `crate::object::KernelPageTables`'s doc) — acceptable for a
-    // handful of Phase 1 loader mappings, not a real memory budget concern yet.
+    // that failure into an ordinary `NotEnoughMemory` return. A walk often needs
+    // fewer (a target branch was already valid from an earlier `Map` sharing the
+    // same region), and whatever it didn't take goes straight back: a program
+    // that maps repeatedly, as Wasmtime's `mmap` does, must not drain the arena.
     let max_new_tables = match size {
         FrameSize::Small => 2,
         FrameSize::Mega => 1,
@@ -139,7 +137,7 @@ fn map(
         *slot = state.kernel_page_tables.alloc().ok_or(SyscallError::NotEnoughMemory)?;
     }
     let mut next_spare = 0usize;
-    let mut alloc = move || {
+    let mut alloc = || {
         let p = spares[next_spare];
         next_spare += 1;
         p
@@ -156,6 +154,10 @@ fn map(
             lantern_hal::riscv64_map_megapage(root, vaddr, paddr, perms.to_pte_flags(), &mut alloc)
         },
     }
+
+    // The spares were bumped consecutively and handed out in order, so the unused
+    // ones are the most recent allocations, and nothing has written to them.
+    state.kernel_page_tables.release_last(max_new_tables - next_spare);
 
     let f = state.frames.get_mut(frame_id.0 as usize).expect("checked above");
     f.mapped_at[free_slot] = Some((vspace_id, vaddr));
@@ -369,6 +371,34 @@ mod tests {
         frame.set_mr(1, vspace_cptr);
         frame.set_mr(2, 0x1000_0123); // not page-aligned
         assert_eq!(invoke(&mut state, tcb, frame_cptr, &mut frame), Err(SyscallError::AlignmentError));
+    }
+
+    /// Wasmtime's `mmap` maps over and over from a confined runtime. A map whose walk
+    /// needs no new table must not cost one, or the arena drains and `Map` starts failing.
+    #[test]
+    fn repeated_mapping_consumes_no_page_tables_once_the_branches_exist() {
+        let mut arena = TestArena([0; 64 * 1024]);
+        let (mut state, tcb, frame_cptr, vspace_cptr) = setup(&mut arena);
+
+        let vaddr = 0x1000_0000usize;
+        let map_and_unmap = |state: &mut KernelState| {
+            let mut map = map_frame(PermFlags::READ);
+            map.set_mr(1, vspace_cptr);
+            map.set_mr(2, vaddr);
+            invoke(state, tcb, frame_cptr, &mut map).unwrap();
+            let mut unmap = TrapFrame::zeroed();
+            unmap.set_tag(MessageTag { label: LABEL_UNMAP, length: 0, extra_caps: 0, flags: 0 });
+            unmap.set_mr(1, vspace_cptr);
+            invoke(state, tcb, frame_cptr, &mut unmap).unwrap();
+        };
+
+        map_and_unmap(&mut state); // Builds the L1 and L0 branches.
+        let before = state.kernel_page_tables.alloc().unwrap();
+        for _ in 0..4 * crate::limits::MAX_KERNEL_PAGE_TABLES {
+            map_and_unmap(&mut state);
+        }
+        let after = state.kernel_page_tables.alloc().unwrap();
+        assert_eq!(after, before + lantern_hal::RISCV64_PAGE_SIZE);
     }
 
     #[test]
