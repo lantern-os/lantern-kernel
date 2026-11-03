@@ -7,7 +7,9 @@
 //! `MAX_FRAMES` and `CNODE_SLOTS` are now sized from `lantern-boot-runtime-fs-demo`, the
 //! largest topology, plus room for one more small service. Measured there: 5 CNodes, 4
 //! VSpaces, 20 Frames, 42 root CNode slots, at most 16 kernel page tables. Raising them
-//! from 4/4/16/32 cost about 4 KiB of `.bss`. The other pools are still the original
+//! from 4/4/16/32 cost about 4 KiB of `.bss`. [RFC-0021](../../lantern-rfcs/rfcs/0021-grant-ledger-and-revocation.md)'s
+//! `grant-control` has since used that room: the same demo now takes 6 CNodes, 5 VSpaces, 23
+//! Frames and 53 root slots, so another program needs these raised. The other pools are still the original
 //! placeholders: nothing has come close to them. None of this is tuned for a real workload.
 
 pub const MAX_CNODES: usize = 6;
