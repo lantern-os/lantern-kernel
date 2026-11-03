@@ -8,20 +8,21 @@
 //! largest topology, plus room for one more small service. Measured there: 5 CNodes, 4
 //! VSpaces, 20 Frames, 42 root CNode slots, at most 16 kernel page tables. Raising them
 //! from 4/4/16/32 cost about 4 KiB of `.bss`. [RFC-0021](../../lantern-rfcs/rfcs/0021-grant-ledger-and-revocation.md)'s
-//! `grant-control` has since used that room: the same demo now takes 6 CNodes, 5 VSpaces, 23
-//! Frames and 53 root slots, so another program needs these raised. The other pools are still the original
+//! `grant-control` and [RFC-0022](../../lantern-rfcs/rfcs/0022-persistent-revocation-store.md)'s
+//! `policy-store` have since grown it, so they were raised again. It now takes 7 CNodes, 6 VSpaces, 27
+//! Frames and 64 root slots of 7, 6, 28 and 72, so another program needs these raised too. The other pools are still the original
 //! placeholders: nothing has come close to them. None of this is tuned for a real workload.
 
-pub const MAX_CNODES: usize = 6;
+pub const MAX_CNODES: usize = 7;
 pub const MAX_TCBS: usize = 8;
 pub const MAX_ENDPOINTS: usize = 8;
 pub const MAX_NOTIFICATIONS: usize = 8;
 pub const MAX_UNTYPEDS: usize = 4;
 pub const MAX_SCHED_CONTEXTS: usize = 8;
-pub const MAX_VSPACES: usize = 5;
+pub const MAX_VSPACES: usize = 6;
 /// System-wide, at megapage granularity (`lantern-boot/STATUS.md`): dozens of 2 MiB
 /// Frames, not hundreds. See the module doc for how this was sized.
-pub const MAX_FRAMES: usize = 24;
+pub const MAX_FRAMES: usize = 28;
 /// Kernel-owned page tables (`crate::object::KernelPageTables`) — `VSpace`
 /// roots (bounded by [`MAX_VSPACES`]) plus the L1/L0 branch pages
 /// `FrameInvoke::Map` creates on demand, one 4 KiB page each. Generous for a
@@ -34,4 +35,4 @@ pub const MAX_KERNEL_PAGE_TABLES: usize = 32;
 
 /// Capacity of a single (flat, single-level) CNode, per RFC-0005's CSpace simplification.
 /// Every CNode pays for this, though only the launcher's root needs this many.
-pub const CNODE_SLOTS: usize = 56;
+pub const CNODE_SLOTS: usize = 72;

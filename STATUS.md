@@ -162,6 +162,9 @@ runs.
 - `Revoke` is cleanly refused (`IllegalOperation`), not implemented — needs a
   capability-derivation tree; `Delete` doesn't reclaim the underlying pooled object either
   (no refcounting yet).
+- **Limits raised again for [RFC-0022](../lantern-rfcs/rfcs/0022-persistent-revocation-store.md)/[ADR-0027](../lantern-rfcs/adr/0027-persistent-revocation-store.md) (2026-11-03).** `MAX_FRAMES` 28, `MAX_CNODES` 7, `MAX_VSPACES` 6, `CNODE_SLOTS` 72.
+  Measured in `runtime-fs-demo` at launch: 27 Frames, 7 CNodes, 6 VSpaces, 64 root slots. No kernel mechanism changed: a
+  device Frame is an ordinary `FrameMega` retyped from an `Untyped` the launcher seeds over a device range.
 - **Limits raised, and sized from data, for RFC-0020 (2026-11-02).** `MAX_FRAMES` 24, `MAX_CNODES` 6,
   `MAX_VSPACES` 5, `CNODE_SLOTS` 56, sized from `lantern-boot-runtime-fs-demo` plus one small service
   (see `src/limits.rs`). Total cost about 4 KiB of `.bss`, which corrects the note below: the expensive
