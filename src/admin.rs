@@ -33,6 +33,11 @@ use crate::state::KernelState;
 /// not real memory accounting for those types. `VSpace`/`Frame*` are the
 /// exception: they always carve from a real physical range, since they *name*
 /// physical memory rather than just occupying a kernel pool slot.
+///
+/// **A retyped `Frame` is not cleared.** This only records its address: general memory isn't mapped
+/// once paging is on, and a device range mustn't be written to. Whoever holds the Untyped must clear
+/// ordinary memory before it reaches anyone else. Today that's only `lantern-boot`'s launcher
+/// (`launch::retype_frame`). Handing a confined program an Untyped would need this revisited.
 pub fn untyped_retype(
     state: &mut KernelState,
     current: TcbId,
