@@ -16,13 +16,15 @@ use lantern_hal::{Hal, Hardware, TrapFrame};
 use crate::cap::{Capability, CNode, CPtr, TcbId};
 use crate::error::SyscallError;
 use crate::limits::{
-    MAX_CNODES, MAX_ENDPOINTS, MAX_FRAMES, MAX_NOTIFICATIONS, MAX_SCHED_CONTEXTS, MAX_TCBS,
-    MAX_UNTYPEDS, MAX_VSPACES,
+    MAX_CNODES, MAX_ENDPOINTS, MAX_FRAMES, MAX_IRQ_ACTIONS, MAX_IRQ_HANDLERS, MAX_NOTIFICATIONS,
+    MAX_SCHED_CONTEXTS, MAX_TCBS, MAX_UNTYPEDS, MAX_VSPACES,
 };
+use crate::irq::IrqAction;
 use crate::object::{
-    Endpoint, Frame, KernelPageTables, Notification, SavedContext, SchedulingContext, Tcb, ThreadState,
-    Untyped, VSpace,
+    Endpoint, Frame, IrqHandler, KernelPageTables, Notification, SavedContext, SchedulingContext, Tcb,
+    ThreadState, Untyped, VSpace,
 };
+use crate::queue::ArrayQueue;
 use crate::pool::Pool;
 use crate::scheduler::Scheduler;
 
@@ -43,6 +45,15 @@ pub struct KernelState {
     /// above draws from.
     pub kernel_page_tables: KernelPageTables,
     pub scheduler: Scheduler,
+    /// RFC-0027: the bound interrupt lines, and the controller actions waiting for the trap glue.
+    pub irq_handlers: Pool<IrqHandler, MAX_IRQ_HANDLERS>,
+    pub irq_actions: ArrayQueue<IrqAction, MAX_IRQ_ACTIONS>,
+    /// The time slice: whose it is (`None` while idle, so the next thread to run starts a fresh one), when it ends, and
+    /// what the hardware timer is armed for (`u64::MAX`: disarmed). The timer is armed lazily, at or before
+    /// `slice_end`, so a switch costs a clock read and not a call into firmware (`crate::handle_trap`).
+    pub timer_owner: Option<TcbId>,
+    pub slice_end: u64,
+    pub timer_armed: u64,
 }
 
 impl KernelState {
@@ -58,6 +69,11 @@ impl KernelState {
             frames: Pool::new(),
             kernel_page_tables: KernelPageTables::new(),
             scheduler: Scheduler::new(),
+            irq_handlers: Pool::new(),
+            irq_actions: ArrayQueue::new(),
+            timer_owner: None,
+            slice_end: 0,
+            timer_armed: u64::MAX,
         }
     }
 
@@ -85,23 +101,25 @@ impl KernelState {
     }
 
     /// Blocks the current thread: the caller must already have set its `ThreadState`
-    /// and enqueued it wherever it needs to wait *before* calling this. Switches to
-    /// the next ready thread and returns `true`, or — if the ready queue is empty —
-    /// makes no changes and returns `false`.
+    /// and enqueued it wherever it needs to wait *before* calling this. Saves it, and
+    /// switches to the next ready thread, returning `true`.
     ///
-    /// Phase 1 has no idle thread (needs a boot-provided idle loop), so callers
-    /// **must** check [`Scheduler::has_ready`] before committing to a block (setting
-    /// state / pushing onto a wait queue) rather than relying on this to roll one
-    /// back — this method does not undo the caller's bookkeeping on `false`.
+    /// With nothing ready it returns `false`, leaving **no current thread**. The trap
+    /// glue then idles until an interrupt makes something ready
+    /// ([RFC-0027](../../lantern-rfcs/rfcs/0027-interrupt-delivery-timer-and-idle.md)).
+    /// Before RFC-0027 this was refused instead, and callers had to check first.
     pub fn block_current(&mut self, frame: &mut TrapFrame) -> bool {
-        if !self.scheduler.has_ready() {
-            return false;
-        }
         self.save_current(frame);
         self.scheduler.current = None;
-        // has_ready() was just true and nothing else can run between the check and
-        // this pop (single-stack, non-reentrant — ADR-0010), so this always succeeds.
-        let next = self.scheduler.ready.pop_front().expect("ready queue was non-empty");
+        self.resume_next(frame)
+    }
+
+    /// With no current thread, starts the next ready one: `true` if there was one.
+    pub fn resume_next(&mut self, frame: &mut TrapFrame) -> bool {
+        debug_assert!(self.scheduler.current.is_none(), "resume_next with a thread still current");
+        let Some(next) = self.scheduler.ready.pop_front() else {
+            return false;
+        };
         if let Some(tcb) = self.tcbs.get_mut(next.0 as usize) {
             tcb.context.restore_into(frame);
             tcb.state = ThreadState::Running;
@@ -111,21 +129,20 @@ impl KernelState {
         true
     }
 
-    /// Re-enqueues `id` as ready. Used both to admit a newly configured thread and
-    /// to wake a blocked one.
-    ///
-    /// **Idempotent for a thread that's already `Ready`.** This is the only place a
-    /// thread becomes `Ready`, so `Ready` ⇔ "in the ready queue exactly once" — and a
-    /// second push would break that. It used to happen: `admin::configure` already
-    /// enqueues every newly configured thread, and `lantern-boot`'s multi-program
-    /// loaders then called `make_ready` on their services again. The stale duplicate
-    /// sat in the queue until long after the service had run and blocked in `Recv`;
-    /// popping it later "resumed" a thread that was still blocked, which then handled
-    /// a phantom request, overwrote its shared `Frame`, and left a second waiter on its
-    /// endpoint. Whether that corrupted anything visible depended on the exact
-    /// interleaving — found by `lantern-boot`'s runtime-fs demo, where one extra
-    /// (harmless) READ before a WRITE turned the store's later decrypt into `FAILED`.
-    /// Same family as `enter_first_thread`'s `remove_ready` fix, for every other thread.
+    /// The timer's preemption point (RFC-0027): if another thread is ready, the current one goes to the back of the
+    /// queue and the next one runs. `true` if that switched. Only ever reached from a trap taken in U-mode, so a
+    /// system call is never cut short (ADR-0010).
+    pub fn preempt(&mut self, frame: &mut TrapFrame) -> bool {
+        let Some(current) = self.scheduler.current else {
+            return false;
+        };
+        if !self.scheduler.has_ready() {
+            return false;
+        }
+        self.make_ready(current);
+        self.block_current(frame)
+    }
+
     pub fn make_ready(&mut self, id: TcbId) {
         if let Some(tcb) = self.tcbs.get_mut(id.0 as usize) {
             if tcb.state == ThreadState::Ready {
@@ -263,15 +280,41 @@ mod tests {
     }
 
     #[test]
-    fn block_current_refuses_when_nothing_else_is_ready() {
+    fn blocking_with_nothing_ready_leaves_no_current_thread_and_resumes_on_wake() {
         let mut state = KernelState::new();
         let a = TcbId(state.tcbs.alloc(Tcb::new()).unwrap() as u16);
         make_current(&mut state, a);
 
         let mut frame = TrapFrame::zeroed();
+        frame.set_mr(0, 111);
         assert!(!state.block_current(&mut frame));
-        // current is left exactly as it was — no phantom switch happened.
+        assert_eq!(state.scheduler.current, None, "the trap glue idles now");
+        assert!(!state.resume_next(&mut frame), "still nothing to run");
+
+        // An interrupt wakes it: it resumes exactly as it was saved.
+        state.make_ready(a);
+        frame.set_mr(0, 999);
+        assert!(state.resume_next(&mut frame));
         assert_eq!(state.scheduler.current, Some(a));
+        assert_eq!(frame.mr(0), 111);
+    }
+
+    #[test]
+    fn preemption_switches_only_when_another_thread_is_ready_and_requeues_the_current_one() {
+        let mut state = KernelState::new();
+        let a = TcbId(state.tcbs.alloc(Tcb::new()).unwrap() as u16);
+        make_current(&mut state, a);
+        let mut frame = TrapFrame::zeroed();
+        frame.set_mr(0, 111);
+        assert!(!state.preempt(&mut frame), "alone, it keeps running");
+        assert_eq!((state.scheduler.current, frame.mr(0)), (Some(a), 111));
+
+        let b = spawn_ready(&mut state);
+        assert!(state.preempt(&mut frame));
+        assert_eq!(state.scheduler.current, Some(b));
+        // And the slice after that goes back to `a`, with its registers intact.
+        assert!(state.preempt(&mut frame));
+        assert_eq!((state.scheduler.current, frame.mr(0)), (Some(a), 111));
     }
 
     #[test]

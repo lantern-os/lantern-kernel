@@ -36,3 +36,11 @@ pub const MAX_KERNEL_PAGE_TABLES: usize = 32;
 /// Capacity of a single (flat, single-level) CNode, per RFC-0005's CSpace simplification.
 /// Every CNode pays for this, though only the launcher's root needs this many.
 pub const CNODE_SLOTS: usize = 72;
+/// Interrupt lines bound to a driver at once ([RFC-0027](../../lantern-rfcs/rfcs/0027-interrupt-delivery-timer-and-idle.md)).
+/// The console needs one; storage and network will each need one more.
+pub const MAX_IRQ_HANDLERS: usize = 4;
+/// Controller actions waiting for the trap glue to apply them, between two traps. Each `IrqHandlerInvoke` queues at
+/// most two, and each delivery two.
+pub const MAX_IRQ_ACTIONS: usize = 16;
+/// Every thread's time slice: ADR-0009's `budget == period`, replenished each period (RFC-0027).
+pub const QUANTUM_NS: u64 = 10_000_000;

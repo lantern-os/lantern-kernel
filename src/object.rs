@@ -445,6 +445,25 @@ impl SchedulingContext {
     }
 }
 
+
+/// One interrupt line and the notification it signals —
+/// [RFC-0027](../../lantern-rfcs/rfcs/0027-interrupt-delivery-timer-and-idle.md). `pending` means delivered and not
+/// yet acknowledged: the line stays claimed at the controller until `Ack`, so it can't fire again before then.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IrqHandler {
+    pub line: u16,
+    /// The notification and the badge bits delivery ORs into it. A badge of 0 is refused at binding, since with no
+    /// waiter, ORing in 0 would lose the interrupt.
+    pub notification: Option<(crate::cap::NotificationId, u64)>,
+    pub pending: bool,
+}
+
+impl IrqHandler {
+    pub const fn new(line: u16) -> Self {
+        Self { line, notification: None, pending: false }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -138,6 +138,18 @@
   only covered the first-run thread. New test `make_ready_twice_enqueues_once`; 64 tests
   green; all eight `lantern-boot` demos pass under QEMU with the loaders unchanged.
 
+- **Interrupts, a preemption timer and an idle loop (2026-11-11, [RFC-0027](../lantern-rfcs/rfcs/0027-interrupt-delivery-timer-and-idle.md)/[ADR-0031](../lantern-rfcs/adr/0031-interrupt-delivery-timer-and-idle.md)).** A new `IrqHandler` capability (not retypable;
+  only boot code creates one, through `irq::create`) binds one interrupt line to a notification, with a nonzero badge. Delivery
+  signals it and leaves the line claimed until the driver's `IrqHandlerInvoke::Ack`, so a storm costs one delivery per
+  acknowledgement. Invocations queue `IrqAction`s rather than touching the controller, so `irq` is host-tested like IPC. A
+  10 ms slice preempts a thread only from U-mode, and **the timer is armed lazily**: a switch records the new slice's end, and
+  a firing that's early re-arms instead of preempting. Re-arming on every switch was measured first, and nearly doubled an IPC
+  round trip, since each `set_timer` is an SBI call into firmware. Blocking with nothing ready no longer returns `Timeout`:
+  `block_current` leaves no current thread, and `handle_trap`, generic over `Hal` and tested against a fake controller, waits
+  with interrupts masked. 76 tests. Under QEMU: `lantern-boot-irq-demo` echoes typed input through a confined driver
+  beside a program that never yields, and idles at 0 CPU ticks over 3 s. Every demo and `binder-matrix.sh` pass with preemption
+  on. The IPC benchmark reads 31,000 to 32,600 instructions per round trip, from 28,700 to 30,000 before. The glue accounts for
+  about 1,000; the rest is within the benchmark's run-to-run spread of about 1,500.
 ## Validated under real QEMU
 [`lantern-boot`](../lantern-boot)'s loader (`src/loader.rs`, RFC-0008) drives a full
 `Call`→`Recv`→`Reply` round trip through real `riscv64` traps under `qemu-system-riscv64`,
@@ -182,12 +194,9 @@ runs.
   around this time by shrinking the *program* instead (`lantern-boot/STATUS.md`'s
   `wasm-probe-demo` entry) — a real fix (bigger Frame sizes, e.g. 1 GiB pages, or on-demand
   `Untyped`→`Frame` retyping past a fixed pool) is real design work, not done here.
-- No idle thread: a blocking operation with no other ready thread refuses with an error
-  (reusing `SyscallError::Timeout`, an imperfect semantic fit) rather than stranding the
-  hart. The QEMU demo sidesteps this by construction (always ≥1 ready thread when either
-  blocks) rather than by fixing it.
-- IRQ-handler objects don't exist yet (interrupt-controller HAL support is a separate,
-  unstarted dependency — `lantern-hal/STATUS.md`).
+- ~~No idle thread~~ and ~~no IRQ-handler objects~~: both done by RFC-0027. Still missing: user-space timeouts (the next
+  RFC, on the same timer), priorities (a woken driver waits up to one quantum per ready thread), `IrqControl` for a
+  user-space launcher, and more than one hart.
 - `cnode::invoke`'s original `Copy`/`Move` still only operate on slots *within a single
   CNode* — that part is unchanged and still true. Cross-CNode placement is now possible via
   the separate `CopyCross` operation (RFC-0010, above), used by `lantern-boot/loader.rs`
@@ -272,9 +281,7 @@ runs.
   [ADR-0022](../lantern-rfcs/adr/0022-confined-service-model-and-call-transport.md)/[ADR-0023](../lantern-rfcs/adr/0023-wasmtime-no-std-pulley-hosting.md))
   needs real `Revoke` for "a revocable capability set" on a still-running app; it does not
   block that work's v0 (tear the process down instead).
-- An idle thread, once `lantern-boot` can provide one — RFC-0018's synchronous
-  request/reply service mesh never reaches "all threads blocked", but `lantern-network`'s
-  first blocking socket read will need it.
+- User-space timeouts: a notification signalled at a deadline, on RFC-0027's timer (RFC-0027's unresolved question 5).
 - RFC-0010's kernel-side scope is now fully implemented (outbound transfer, `CopyCross`,
   reply-leg transfer). `lantern-capabilities`' `Broker` (see its own `STATUS.md`) still
   grants over a plain `Send`, not `Call`/`Reply` — updating it to use the now-real

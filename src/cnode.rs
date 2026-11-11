@@ -106,6 +106,7 @@ fn attenuate(source: Capability, rights: Rights, badge: u64) -> Result<Capabilit
         Capability::SchedContext { id, .. } => Capability::SchedContext { id, rights },
         Capability::VSpace { id, .. } => Capability::VSpace { id, rights },
         Capability::Frame { id, .. } => Capability::Frame { id, rights },
+        Capability::IrqHandler { id, .. } => Capability::IrqHandler { id, rights },
         Capability::CNode(_) | Capability::Null | Capability::Reply { .. } => {
             return Err(SyscallError::IllegalOperation);
         }
