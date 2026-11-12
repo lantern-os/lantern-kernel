@@ -31,9 +31,11 @@ guarantee in LanternOS rests on the kernel being correct.
 | K4 | Kernel memory exhaustion | No post-boot kernel heap; all object memory from accounted user untyped. |
 | K5 | IPC message confusion / leakage | Typed message transfer; badged endpoints; shared mutable state is a deliberate, capped exception (K9), not the default. |
 | K6 | DMA bypass of isolation by a driver | IOMMU confinement (HAL/hardware dependency — see open questions). |
-| K7 | Interrupt-path escalation | IRQs delivered only to holders of the IRQ capability, as notifications. |
+| K7 | Interrupt-path escalation | IRQs delivered only to holders of the IRQ capability, as notifications ([ADR-0031](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0031-interrupt-delivery-timer-and-idle.md)). Only boot code creates an `IrqHandler`; it isn't retypable from memory. Interrupts are taken only from U-mode, never while the kernel runs. |
 | K8 | Timing/covert channels between components | Acknowledged; partial mitigation via scheduling isolation; not fully solved (see non-goals). |
 | K9 | A shared `Frame`'s two mappers racing/corrupting each other's view of it (ADR-0022 Part 2) | `MAX_FRAME_MAPPINGS == 2` caps this to exactly the designed `(runtime, service)` pair, never a third party; the kernel enforces only that cap — content-level races are each service's own responsibility (copy-in before `check_access`/before operating, RFC-0019's mitigation, not a kernel one). |
+| K10 | An interrupt storm from a device | The line stays claimed from delivery until the driver's `Ack`, so a storm costs one delivery per acknowledgement, and at most 8 claims are handled per trap (ADR-0031). |
+| K11 | A program that spins, or a driver that never acknowledges | A 10 ms slice preempts every thread, so a spin slows the system instead of stopping it. A driver that never acks silences only its own line (ADR-0031). |
 
 ## TCB posture
 The kernel commits to staying minimal: each addition is an RFC-level decision carrying a

@@ -12,7 +12,7 @@
 use lantern_hal::{MessageTag, TrapFrame};
 
 use crate::abi;
-use crate::cap::{Capability, CPtr, EndpointId, Rights, TcbId};
+use crate::cap::{Capability, CPtr, EndpointId, NotificationId, Rights, TcbId};
 use crate::error::SyscallError;
 use crate::object::{EndpointQueue, ThreadState};
 use crate::queue::ArrayQueue;
@@ -195,9 +195,6 @@ pub fn send(
         return Ok(());
     }
 
-    if !state.scheduler.has_ready() {
-        return Err(SyscallError::Timeout);
-    }
     let mut send_queue = match endpoint.queue {
         EndpointQueue::Send(q) => q,
         EndpointQueue::Empty => ArrayQueue::new(),
@@ -210,8 +207,8 @@ pub fn send(
     if let Some(tcb) = state.tcbs.get_mut(current.0 as usize) {
         tcb.state = ThreadState::BlockedSend { endpoint: id, badge, is_call: false, extra_cap, reply_dest_slot: None };
     }
-    let switched = state.block_current(frame);
-    debug_assert!(switched, "has_ready() was checked immediately above");
+    // With nothing else ready this leaves no current thread, and the trap glue idles (RFC-0027).
+    state.block_current(frame);
     Ok(())
 }
 
@@ -274,9 +271,6 @@ pub fn recv(
         return Ok(());
     }
 
-    if !state.scheduler.has_ready() {
-        return Err(SyscallError::Timeout);
-    }
     let mut recv_queue = match endpoint.queue {
         EndpointQueue::Recv(q) => q,
         EndpointQueue::Empty => ArrayQueue::new(),
@@ -289,8 +283,8 @@ pub fn recv(
     if let Some(tcb) = state.tcbs.get_mut(current.0 as usize) {
         tcb.state = ThreadState::BlockedRecv { endpoint: id, dest_slot };
     }
-    let switched = state.block_current(frame);
-    debug_assert!(switched, "has_ready() was checked immediately above");
+    // With nothing else ready this leaves no current thread, and the trap glue idles (RFC-0027).
+    state.block_current(frame);
     Ok(())
 }
 
@@ -338,9 +332,6 @@ pub fn call(
         return Ok(());
     }
 
-    if !state.scheduler.has_ready() {
-        return Err(SyscallError::Timeout);
-    }
     let mut send_queue = match endpoint.queue {
         EndpointQueue::Send(q) => q,
         EndpointQueue::Empty => ArrayQueue::new(),
@@ -353,8 +344,8 @@ pub fn call(
     if let Some(tcb) = state.tcbs.get_mut(current.0 as usize) {
         tcb.state = ThreadState::BlockedSend { endpoint: id, badge, is_call: true, extra_cap, reply_dest_slot };
     }
-    let switched = state.block_current(frame);
-    debug_assert!(switched, "has_ready() was checked immediately above");
+    // With nothing else ready this leaves no current thread, and the trap glue idles (RFC-0027).
+    state.block_current(frame);
     Ok(())
 }
 
@@ -434,8 +425,15 @@ pub fn signal(
     frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
     let (id, badge) = resolve_notification(state, current, cptr, Rights::WRITE)?;
-    let notif = *state.notifications.get(id.0 as usize).ok_or(SyscallError::InvalidCapability)?;
+    signal_notification(state, id, badge)?;
+    abi::reply_success(frame);
+    Ok(())
+}
 
+/// ORs `badge` into a notification, waking its first waiter if one is blocked in `Wait`. `Signal`'s body, and how
+/// the kernel delivers an interrupt ([`crate::irq::deliver`]).
+pub(crate) fn signal_notification(state: &mut KernelState, id: NotificationId, badge: u64) -> Result<(), SyscallError> {
+    let notif = *state.notifications.get(id.0 as usize).ok_or(SyscallError::InvalidCapability)?;
     let mut waiters = notif.waiters;
     if let Some(waiter) = waiters.pop_front() {
         let delivered = notif.signals | badge;
@@ -450,7 +448,6 @@ pub fn signal(
     } else if let Some(n) = state.notifications.get_mut(id.0 as usize) {
         n.signals |= badge;
     }
-    abi::reply_success(frame);
     Ok(())
 }
 
@@ -472,9 +469,6 @@ pub fn wait(
         return Ok(());
     }
 
-    if !state.scheduler.has_ready() {
-        return Err(SyscallError::Timeout);
-    }
     let mut waiters = notif.waiters;
     if !waiters.push_back(current) {
         return Err(SyscallError::NotEnoughMemory);
@@ -485,8 +479,8 @@ pub fn wait(
     if let Some(tcb) = state.tcbs.get_mut(current.0 as usize) {
         tcb.state = ThreadState::BlockedWait(id);
     }
-    let switched = state.block_current(frame);
-    debug_assert!(switched, "has_ready() was checked immediately above");
+    // With nothing else ready this leaves no current thread, and the trap glue idles (RFC-0027).
+    state.block_current(frame);
     Ok(())
 }
 

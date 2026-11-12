@@ -13,11 +13,9 @@ pub enum SyscallError {
     FailedLookup,
     TruncatedMessage,
     NotEnoughMemory,
-    /// Also reused, for now, to mean "no other thread is ready to run, so this
-    /// operation cannot block without stranding the hart" — Phase 1 has no idle
-    /// thread yet (needs a boot-provided idle loop). Not a perfect semantic fit;
-    /// tracked as a rough edge in `lantern-kernel/STATUS.md` rather than adding a
-    /// tenth variant to a deliberately closed enum.
+    /// Reserved for timeouts. Until [RFC-0027](../../lantern-rfcs/rfcs/0027-interrupt-delivery-timer-and-idle.md)
+    /// it also meant "nothing else is ready, so this can't block without stranding the hart"; the kernel now idles
+    /// instead, and nothing returns it.
     Timeout,
 }
 

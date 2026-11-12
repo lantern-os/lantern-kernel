@@ -32,6 +32,9 @@ pub enum SyscallNumber {
     /// `Map`/`Unmap` — [RFC-0008](../../lantern-rfcs/rfcs/0008-vspace-frame-capabilities-and-elf-loader.md)/
     /// [ADR-0012](../../lantern-rfcs/adr/0012-vspace-frame-capabilities-and-elf-loader.md).
     FrameInvoke = 13,
+    /// [RFC-0027](../../lantern-rfcs/rfcs/0027-interrupt-delivery-timer-and-idle.md): `SET_NOTIFICATION`, `CLEAR`,
+    /// `ACK` on an `IrqHandler`, by the tag's label ([`crate::irq`]).
+    IrqHandlerInvoke = 14,
 }
 
 impl SyscallNumber {
@@ -50,6 +53,7 @@ impl SyscallNumber {
             11 => Self::TCBConfigure,
             12 => Self::Yield,
             13 => Self::FrameInvoke,
+            14 => Self::IrqHandlerInvoke,
             _ => return None,
         })
     }
@@ -102,6 +106,7 @@ pub fn dispatch(state: &mut KernelState, frame: &mut TrapFrame) {
         // `crate::frame`, fully qualified: `dispatch`'s own `frame: &mut TrapFrame`
         // parameter would otherwise shadow the module name.
         SyscallNumber::FrameInvoke => crate::frame::invoke(state, current, cptr, frame),
+        SyscallNumber::IrqHandlerInvoke => crate::irq::invoke(state, current, cptr, frame),
         SyscallNumber::Yield => {
             yield_now(state, current, frame);
             Ok(())

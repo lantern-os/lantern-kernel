@@ -26,6 +26,7 @@ define_id!(UntypedId);
 define_id!(SchedContextId);
 define_id!(VSpaceId);
 define_id!(FrameId);
+define_id!(IrqHandlerId);
 
 /// Rights are a bitset over a fixed, small lattice ([RFC-0003](../../lantern-rfcs/rfcs/0003-capability-model.md)
 /// leaves the exact lattice per object type as an open question — this is Phase 1's
@@ -142,12 +143,16 @@ pub enum Capability {
     /// capability's own field, since it's a property of the underlying
     /// [`crate::object::Frame`], not something a capability copy/mint could change.
     Frame { id: FrameId, rights: Rights },
+    /// One interrupt line, bound to a `Notification` by its holder —
+    /// [RFC-0027](../../lantern-rfcs/rfcs/0027-interrupt-delivery-timer-and-idle.md). Not retypable from `Untyped`:
+    /// only the boot-time loader creates one (`crate::irq::create`), so holding memory never means holding a line.
+    IrqHandler { id: IrqHandlerId, rights: Rights },
 }
 
 impl Capability {
     pub const fn object_type(&self) -> Option<ObjectType> {
         match self {
-            Capability::Null | Capability::Reply { .. } => None,
+            Capability::Null | Capability::Reply { .. } | Capability::IrqHandler { .. } => None,
             Capability::CNode(_) => Some(ObjectType::CNode),
             Capability::Untyped { .. } => Some(ObjectType::Untyped),
             Capability::Endpoint { .. } => Some(ObjectType::Endpoint),
@@ -174,7 +179,8 @@ impl Capability {
             | Capability::Tcb { rights, .. }
             | Capability::SchedContext { rights, .. }
             | Capability::VSpace { rights, .. }
-            | Capability::Frame { rights, .. } => *rights,
+            | Capability::Frame { rights, .. }
+            | Capability::IrqHandler { rights, .. } => *rights,
         }
     }
 }

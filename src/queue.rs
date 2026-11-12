@@ -18,6 +18,14 @@ impl<T: Copy, const N: usize> ArrayQueue<T, N> {
         self.len == 0
     }
 
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub const fn capacity(&self) -> usize {
+        N
+    }
+
     /// The head element, if any, without removing it — lets a caller validate
     /// something about the front of the queue before committing to `pop_front`
     /// (RFC-0010's capability-transfer path needs this: check the receiver has a
