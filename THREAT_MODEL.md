@@ -36,6 +36,7 @@ guarantee in LanternOS rests on the kernel being correct.
 | K9 | A shared `Frame`'s two mappers racing/corrupting each other's view of it (ADR-0022 Part 2) | `MAX_FRAME_MAPPINGS == 2` caps this to exactly the designed `(runtime, service)` pair, never a third party; the kernel enforces only that cap — content-level races are each service's own responsibility (copy-in before `check_access`/before operating, RFC-0019's mitigation, not a kernel one). |
 | K10 | An interrupt storm from a device | The line stays claimed from delivery until the driver's `Ack`, so a storm costs one delivery per acknowledgement, and at most 8 claims are handled per trap (ADR-0031). |
 | K11 | A program that spins, or a driver that never acknowledges | A 10 ms slice preempts every thread, so a spin slows the system instead of stopping it. A driver that never acks silences only its own line (ADR-0031). |
+| K12 | A clock as the raw material of timing side channels | Time is a capability: only a holder of a `Deadline` can read it, and `scounteren` stays clear so U-mode can't `rdtime` ([ADR-0033](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0033-deadlines-and-a-capability-clock.md)). Holders can still time their own operations. |
 
 ## TCB posture
 The kernel commits to staying minimal: each addition is an RFC-level decision carrying a

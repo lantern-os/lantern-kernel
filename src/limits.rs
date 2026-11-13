@@ -44,3 +44,6 @@ pub const MAX_IRQ_HANDLERS: usize = 4;
 pub const MAX_IRQ_ACTIONS: usize = 16;
 /// Every thread's time slice: ADR-0009's `budget == period`, replenished each period (RFC-0027).
 pub const QUANTUM_NS: u64 = 10_000_000;
+/// Armed-or-not `Deadline`s at once ([RFC-0028](../../lantern-rfcs/rfcs/0028-deadlines-and-a-capability-clock.md)).
+/// Finding the earliest is a scan of these, on every trap.
+pub const MAX_DEADLINES: usize = 8;

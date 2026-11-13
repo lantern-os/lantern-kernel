@@ -464,6 +464,16 @@ impl IrqHandler {
     }
 }
 
+/// A one-shot deadline — [RFC-0028](../../lantern-rfcs/rfcs/0028-deadlines-and-a-capability-clock.md). When the monotonic
+/// clock reaches `at`, the kernel signals `notification` once and disarms it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Deadline {
+    /// The notification, and the badge bits expiry ORs into it. Nonzero, as for an `IrqHandler`.
+    pub notification: Option<(crate::cap::NotificationId, u64)>,
+    /// Armed for this monotonic time, in ns.
+    pub at: Option<u64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

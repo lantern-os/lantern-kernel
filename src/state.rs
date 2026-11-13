@@ -16,12 +16,12 @@ use lantern_hal::{Hal, Hardware, TrapFrame};
 use crate::cap::{Capability, CNode, CPtr, TcbId};
 use crate::error::SyscallError;
 use crate::limits::{
-    MAX_CNODES, MAX_ENDPOINTS, MAX_FRAMES, MAX_IRQ_ACTIONS, MAX_IRQ_HANDLERS, MAX_NOTIFICATIONS,
+    MAX_CNODES, MAX_DEADLINES, MAX_ENDPOINTS, MAX_FRAMES, MAX_IRQ_ACTIONS, MAX_IRQ_HANDLERS, MAX_NOTIFICATIONS,
     MAX_SCHED_CONTEXTS, MAX_TCBS, MAX_UNTYPEDS, MAX_VSPACES,
 };
 use crate::irq::IrqAction;
 use crate::object::{
-    Endpoint, Frame, IrqHandler, KernelPageTables, Notification, SavedContext, SchedulingContext, Tcb,
+    Deadline, Endpoint, Frame, IrqHandler, KernelPageTables, Notification, SavedContext, SchedulingContext, Tcb,
     ThreadState, Untyped, VSpace,
 };
 use crate::queue::ArrayQueue;
@@ -54,6 +54,10 @@ pub struct KernelState {
     pub timer_owner: Option<TcbId>,
     pub slice_end: u64,
     pub timer_armed: u64,
+    /// RFC-0028: the deadlines, and the monotonic time the trap glue read on entry to this trap. Reading it once there
+    /// keeps everything the kernel decides from it pure logic, testable without hardware.
+    pub deadlines: Pool<Deadline, MAX_DEADLINES>,
+    pub now: u64,
 }
 
 impl KernelState {
@@ -74,6 +78,8 @@ impl KernelState {
             timer_owner: None,
             slice_end: 0,
             timer_armed: u64::MAX,
+            deadlines: Pool::new(),
+            now: 0,
         }
     }
 

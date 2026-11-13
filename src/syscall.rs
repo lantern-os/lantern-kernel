@@ -35,6 +35,9 @@ pub enum SyscallNumber {
     /// [RFC-0027](../../lantern-rfcs/rfcs/0027-interrupt-delivery-timer-and-idle.md): `SET_NOTIFICATION`, `CLEAR`,
     /// `ACK` on an `IrqHandler`, by the tag's label ([`crate::irq`]).
     IrqHandlerInvoke = 14,
+    /// [RFC-0028](../../lantern-rfcs/rfcs/0028-deadlines-and-a-capability-clock.md): `SET_NOTIFICATION`, `ARM`, `CANCEL`,
+    /// `NOW` on a `Deadline`, by the tag's label ([`crate::deadline`]).
+    DeadlineInvoke = 15,
 }
 
 impl SyscallNumber {
@@ -54,6 +57,7 @@ impl SyscallNumber {
             12 => Self::Yield,
             13 => Self::FrameInvoke,
             14 => Self::IrqHandlerInvoke,
+            15 => Self::DeadlineInvoke,
             _ => return None,
         })
     }
@@ -107,6 +111,7 @@ pub fn dispatch(state: &mut KernelState, frame: &mut TrapFrame) {
         // parameter would otherwise shadow the module name.
         SyscallNumber::FrameInvoke => crate::frame::invoke(state, current, cptr, frame),
         SyscallNumber::IrqHandlerInvoke => crate::irq::invoke(state, current, cptr, frame),
+        SyscallNumber::DeadlineInvoke => crate::deadline::invoke(state, current, cptr, frame),
         SyscallNumber::Yield => {
             yield_now(state, current, frame);
             Ok(())

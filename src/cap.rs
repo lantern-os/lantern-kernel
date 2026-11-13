@@ -27,6 +27,7 @@ define_id!(SchedContextId);
 define_id!(VSpaceId);
 define_id!(FrameId);
 define_id!(IrqHandlerId);
+define_id!(DeadlineId);
 
 /// Rights are a bitset over a fixed, small lattice ([RFC-0003](../../lantern-rfcs/rfcs/0003-capability-model.md)
 /// leaves the exact lattice per object type as an open question — this is Phase 1's
@@ -147,12 +148,17 @@ pub enum Capability {
     /// [RFC-0027](../../lantern-rfcs/rfcs/0027-interrupt-delivery-timer-and-idle.md). Not retypable from `Untyped`:
     /// only the boot-time loader creates one (`crate::irq::create`), so holding memory never means holding a line.
     IrqHandler { id: IrqHandlerId, rights: Rights },
+    /// A one-shot deadline, and the only way to read the clock —
+    /// [RFC-0028](../../lantern-rfcs/rfcs/0028-deadlines-and-a-capability-clock.md). `WRITE` arms, cancels and binds it;
+    /// `READ` reads the time. Not retypable: only boot code creates one (`crate::deadline::create`), so holding memory
+    /// never means holding the clock.
+    Deadline { id: DeadlineId, rights: Rights },
 }
 
 impl Capability {
     pub const fn object_type(&self) -> Option<ObjectType> {
         match self {
-            Capability::Null | Capability::Reply { .. } | Capability::IrqHandler { .. } => None,
+            Capability::Null | Capability::Reply { .. } | Capability::IrqHandler { .. } | Capability::Deadline { .. } => None,
             Capability::CNode(_) => Some(ObjectType::CNode),
             Capability::Untyped { .. } => Some(ObjectType::Untyped),
             Capability::Endpoint { .. } => Some(ObjectType::Endpoint),
@@ -180,7 +186,8 @@ impl Capability {
             | Capability::SchedContext { rights, .. }
             | Capability::VSpace { rights, .. }
             | Capability::Frame { rights, .. }
-            | Capability::IrqHandler { rights, .. } => *rights,
+            | Capability::IrqHandler { rights, .. }
+            | Capability::Deadline { rights, .. } => *rights,
         }
     }
 }

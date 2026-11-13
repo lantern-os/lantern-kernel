@@ -150,6 +150,11 @@
   beside a program that never yields, and idles at 0 CPU ticks over 3 s. Every demo and `binder-matrix.sh` pass with preemption
   on. The IPC benchmark reads 31,000 to 32,600 instructions per round trip, from 28,700 to 30,000 before. The glue accounts for
   about 1,000; the rest is within the benchmark's run-to-run spread of about 1,500.
+- **Deadlines and a capability-gated clock (2026-11-12, [RFC-0028](../lantern-rfcs/rfcs/0028-deadlines-and-a-capability-clock.md)/[ADR-0033](../lantern-rfcs/adr/0033-deadlines-and-a-capability-clock.md)).** A `Deadline` capability (boot-created, not retypable)
+  signals a bound notification once at an absolute monotonic time; `Now` on it is the only way user space reads the clock.
+  Syscall 15. The timer is armed lazily for the earliest of every deadline and the slice's end, idle included, and the clock
+  is read once per trap into `KernelState::now`. A host test caught idle leaving a pending timer uncleared, which would
+  have made `wfi` return forever. 84 tests. The IPC benchmark is unchanged within its spread.
 ## Validated under real QEMU
 [`lantern-boot`](../lantern-boot)'s loader (`src/loader.rs`, RFC-0008) drives a full
 `Call`→`Recv`→`Reply` round trip through real `riscv64` traps under `qemu-system-riscv64`,
@@ -281,7 +286,7 @@ runs.
   [ADR-0022](../lantern-rfcs/adr/0022-confined-service-model-and-call-transport.md)/[ADR-0023](../lantern-rfcs/adr/0023-wasmtime-no-std-pulley-hosting.md))
   needs real `Revoke` for "a revocable capability set" on a still-running app; it does not
   block that work's v0 (tear the process down instead).
-- User-space timeouts: a notification signalled at a deadline, on RFC-0027's timer (RFC-0027's unresolved question 5).
+- A user-space time service to multiplex and coarsen the clock; wall-clock time (RFC-0028's future possibilities).
 - RFC-0010's kernel-side scope is now fully implemented (outbound transfer, `CopyCross`,
   reply-leg transfer). `lantern-capabilities`' `Broker` (see its own `STATUS.md`) still
   grants over a plain `Send`, not `Call`/`Reply` — updating it to use the now-real

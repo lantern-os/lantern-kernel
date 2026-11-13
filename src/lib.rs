@@ -47,6 +47,7 @@ pub mod abi;
 pub mod admin;
 pub mod cap;
 pub mod cnode;
+pub mod deadline;
 pub mod error;
 pub mod frame;
 pub mod ipc;
@@ -82,26 +83,33 @@ const MAX_CLAIMS_PER_TRAP: usize = 8;
 /// call, a line to claim, or the timer. Then: apply what the kernel queued for the interrupt controller, idle if
 /// nothing is left to run, and give a thread that has just started running, or whose slice ended, a full quantum.
 ///
-/// **The timer is armed lazily.** A switch only records the new slice's end, which is always later than whatever the
-/// hardware is still armed for. When the timer fires, the thread is preempted only if its own slice has really ended;
-/// otherwise the timer is re-armed for that end. Re-arming on every switch instead cost an SBI call into firmware
-/// each time, which nearly doubled an IPC round trip.
+/// **The timer is armed lazily**, for the earliest of the slice's end and every armed deadline
+/// ([RFC-0028](../../lantern-rfcs/rfcs/0028-deadlines-and-a-capability-clock.md)). A switch only records the new slice's
+/// end, which is always later than whatever the hardware is still armed for. When the timer fires, the thread is
+/// preempted only if its own slice has really ended, and deadlines fire only if their time has come; otherwise the timer
+/// is re-armed. Re-arming on every switch instead cost an SBI call into firmware each time, which nearly doubled an IPC
+/// round trip.
+///
+/// The clock is read once, on entry, into `state.now`: everything the kernel decides from it is then plain logic.
 pub fn handle_trap<H: lantern_hal::Hal>(state: &mut state::KernelState, frame: &mut lantern_hal::TrapFrame) {
     use lantern_hal::TrapCause;
 
+    state.now = H::monotonic_time_ns();
     let cause = frame.cause();
     match cause {
         TrapCause::Syscall => syscall::dispatch(state, frame),
         TrapCause::ExternalInterrupt => claim_pending::<H>(state),
         TrapCause::TimerInterrupt => {
             state.timer_armed = u64::MAX;
-            if H::monotonic_time_ns() >= state.slice_end {
+            if state.now >= state.slice_end {
                 state.preempt(frame);
                 // Whoever runs next, even the same thread when nothing else is ready, starts a fresh slice.
                 state.timer_owner = None;
             }
         }
     }
+    // After every trap, so an `Arm` for a time already past fires on the way out of that same call.
+    deadline::fire_expired(state, state.now);
     apply_irq_actions::<H>(state);
     if state.scheduler.current.is_none() {
         idle::<H>(state, frame);
@@ -110,8 +118,9 @@ pub fn handle_trap<H: lantern_hal::Hal>(state: &mut state::KernelState, frame: &
         state.slice_end = H::monotonic_time_ns().saturating_add(limits::QUANTUM_NS);
         state.timer_owner = state.scheduler.current;
     }
-    if state.timer_armed > state.slice_end {
-        arm_timer::<H>(state);
+    let target = deadline::earliest(state).map_or(state.slice_end, |at| at.min(state.slice_end));
+    if state.timer_armed > target {
+        arm_timer::<H>(state, target);
     }
 }
 
@@ -136,23 +145,30 @@ fn apply_irq_actions<H: lantern_hal::Hal>(state: &mut state::KernelState) {
     }
 }
 
-fn arm_timer<H: lantern_hal::Hal>(state: &mut state::KernelState) {
-    H::set_timer(state.slice_end);
-    state.timer_armed = state.slice_end;
+fn arm_timer<H: lantern_hal::Hal>(state: &mut state::KernelState, at: u64) {
+    H::set_timer(at);
+    state.timer_armed = at;
 }
 
 /// Nothing is ready: wait for an interrupt with interrupts still masked, deliver it, and start whatever it made ready.
-/// The timer is disarmed while idle, since there's nothing to preempt, so it can't keep waking the hart.
+/// The timer is armed only for the earliest deadline, since there's no slice to end: disarmed if there's none, so it
+/// can't keep waking the hart, and armed if there is, so a sleeping system still wakes for it (RFC-0028).
 fn idle<H: lantern_hal::Hal>(state: &mut state::KernelState, frame: &mut lantern_hal::TrapFrame) {
-    H::set_timer(u64::MAX);
-    state.timer_armed = u64::MAX;
     state.timer_owner = None;
     while !state.resume_next(frame) {
+        let target = deadline::earliest(state).unwrap_or(u64::MAX);
+        if state.timer_armed != target {
+            arm_timer::<H>(state, target);
+        }
         H::wait_for_interrupt();
         claim_pending::<H>(state);
         if H::timer_pending() {
-            H::set_timer(u64::MAX);
+            // Setting the timer is what clears its pending interrupt. Without this, a pending timer with no deadline left
+            // to arm for would make every `wfi` return at once: an idle that never idles.
+            arm_timer::<H>(state, u64::MAX);
         }
+        state.now = H::monotonic_time_ns();
+        deadline::fire_expired(state, state.now);
     }
 }
 
@@ -194,7 +210,7 @@ pub unsafe fn enter_first_thread(id: cap::TcbId) -> ! {
     apply_irq_actions::<lantern_hal::Hardware>(state);
     state.slice_end = lantern_hal::Hardware::monotonic_time_ns().saturating_add(limits::QUANTUM_NS);
     state.timer_owner = Some(id);
-    arm_timer::<lantern_hal::Hardware>(state);
+    arm_timer::<lantern_hal::Hardware>(state, state.slice_end);
     let mut frame = lantern_hal::TrapFrame::zeroed();
     if let Some(tcb) = state.tcbs.get_mut(id.0 as usize) {
         tcb.state = object::ThreadState::Running;
@@ -228,6 +244,8 @@ mod tests {
         timer_pending: bool,
         /// What `wait_for_interrupt` makes pending: one line per wait.
         on_wait: Vec<u32>,
+        /// Or: the first wait advances the clock to this, and makes the timer pending.
+        on_wait_timer: Option<u64>,
     }
 
     thread_local! {
@@ -275,6 +293,10 @@ mod tests {
             fake(|f| {
                 assert!(f.calls.iter().filter(|c| *c == "wait").count() < 10, "idle never woke");
                 f.calls.push("wait".into());
+                if let Some(at) = f.on_wait_timer.take() {
+                    f.now = at;
+                    f.timer_pending = true;
+                }
                 if !f.on_wait.is_empty() {
                     let line = f.on_wait.remove(0);
                     f.claims.push(line);
@@ -333,6 +355,37 @@ mod tests {
         assert_eq!(state.scheduler.current, Some(tcb));
         assert_eq!(frame.mr(0), 1, "woke with its badge");
         assert_eq!(state.timer_owner, Some(tcb));
+    }
+
+    #[test]
+    fn idle_arms_the_timer_for_the_earliest_deadline_and_wakes_its_waiter() {
+        fake(|f| *f = Fake { now: 1000, ..Fake::default() });
+        let mut state = state::KernelState::new();
+        let (tcb, notification) = driver(&mut state);
+        let Some(Capability::Deadline { id, .. }) = deadline::create(&mut state) else { panic!() };
+        state.deadlines.get_mut(id.0 as usize).unwrap().notification = Some((notification, 0b100));
+        state.deadlines.get_mut(id.0 as usize).unwrap().at = Some(5000);
+        running(&mut state, tcb, 2000);
+        // The wait itself makes the timer fire at 5000.
+        fake(|f| f.on_wait_timer = Some(5000));
+        let mut frame = syscall(SyscallNumber::Wait, NOTIFICATION_CPTR);
+        handle_trap::<FakeHal>(&mut state, &mut frame);
+        assert_eq!(calls(), ["arm 5000", "wait", "disarm", format!("arm {}", 5000 + limits::QUANTUM_NS).as_str()]);
+        assert_eq!((state.scheduler.current, frame.mr(0)), (Some(tcb), 0b100));
+        assert_eq!(deadline::earliest(&state), None);
+    }
+
+    #[test]
+    fn a_pending_timer_with_nothing_left_to_arm_is_cleared_not_left_to_spin() {
+        fake(|f| *f = Fake { now: 1000, on_wait: vec![0, 10], on_wait_timer: Some(1500), ..Fake::default() });
+        let mut state = state::KernelState::new();
+        let (tcb, _) = driver(&mut state);
+        running(&mut state, tcb, 2000);
+        let mut frame = syscall(SyscallNumber::Wait, NOTIFICATION_CPTR);
+        handle_trap::<FakeHal>(&mut state, &mut frame);
+        // The stale slice timer fires during the first wait, and is cleared; the second wait gets the line.
+        assert_eq!(calls()[..4], ["disarm", "wait", "disarm", "wait"]);
+        assert!(!fake(|f| f.timer_pending));
     }
 
     #[test]
