@@ -51,6 +51,18 @@ pub fn invoke(
         LABEL_MOVE => move_cap(state, target, src, dest)?,
         LABEL_DELETE => delete(state, target, src)?,
         LABEL_COPY_CROSS => copy_cross(state, current, target, src, dest, arg3)?,
+        // RFC-0030: `Revoke` on an `Untyped` is `Reset`: everything made from it is destroyed, and it's empty again.
+        // On anything else it's still refused: there's no general derivation tree.
+        LABEL_REVOKE if matches!(
+            state.cnodes.get(target.0 as usize).and_then(|c| c.get(src)),
+            Some(Capability::Untyped { rights, .. }) if rights.contains(Rights::WRITE)
+        ) =>
+        {
+            let Some(Capability::Untyped { id, .. }) = state.cnodes.get(target.0 as usize).and_then(|c| c.get(src)) else {
+                unreachable!("matched above")
+            };
+            crate::reclaim::reset(state, id)?;
+        }
         LABEL_REVOKE => {
             // Recursive revocation needs a capability-derivation tree Phase 1
             // doesn't track yet (RFC-0005 already named "revocation cost model" as
@@ -107,6 +119,7 @@ fn attenuate(source: Capability, rights: Rights, badge: u64) -> Result<Capabilit
         Capability::VSpace { id, .. } => Capability::VSpace { id, rights },
         Capability::Frame { id, .. } => Capability::Frame { id, rights },
         Capability::IrqHandler { id, .. } => Capability::IrqHandler { id, rights },
+        Capability::Deadline { id, .. } => Capability::Deadline { id, rights },
         Capability::CNode(_) | Capability::Null | Capability::Reply { .. } => {
             return Err(SyscallError::IllegalOperation);
         }

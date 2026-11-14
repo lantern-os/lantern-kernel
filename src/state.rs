@@ -13,15 +13,15 @@ use core::cell::UnsafeCell;
 
 use lantern_hal::{Hal, Hardware, TrapFrame};
 
-use crate::cap::{Capability, CNode, CPtr, TcbId};
+use crate::cap::{Capability, CNode, CPtr, TcbId, UntypedId};
 use crate::error::SyscallError;
 use crate::limits::{
-    MAX_CNODES, MAX_ENDPOINTS, MAX_FRAMES, MAX_IRQ_ACTIONS, MAX_IRQ_HANDLERS, MAX_NOTIFICATIONS,
+    MAX_CNODES, MAX_DEADLINES, MAX_ENDPOINTS, MAX_FRAMES, MAX_IRQ_ACTIONS, MAX_IRQ_HANDLERS, MAX_NOTIFICATIONS,
     MAX_SCHED_CONTEXTS, MAX_TCBS, MAX_UNTYPEDS, MAX_VSPACES,
 };
 use crate::irq::IrqAction;
 use crate::object::{
-    Endpoint, Frame, IrqHandler, KernelPageTables, Notification, SavedContext, SchedulingContext, Tcb,
+    Deadline, Endpoint, Frame, IrqHandler, KernelPageTables, Notification, SavedContext, SchedulingContext, Tcb,
     ThreadState, Untyped, VSpace,
 };
 use crate::queue::ArrayQueue;
@@ -54,6 +54,47 @@ pub struct KernelState {
     pub timer_owner: Option<TcbId>,
     pub slice_end: u64,
     pub timer_armed: u64,
+    /// RFC-0028: the deadlines, and the monotonic time the trap glue read on entry to this trap. Reading it once there
+    /// keeps everything the kernel decides from it pure logic, testable without hardware.
+    pub deadlines: Pool<Deadline, MAX_DEADLINES>,
+    pub now: u64,
+    /// RFC-0030: the mappings every VSpace gets, and which `Untyped` each retyped object was made from.
+    pub kernel_template: crate::vspace::Template,
+    pub origins: Origins,
+}
+
+/// Which `Untyped` each pooled object was retyped from ([RFC-0030](../../lantern-rfcs/rfcs/0030-process-lifecycle-faults-and-reclamation.md)),
+/// by pool index. `None` for an object boot code made directly, which no `Reset` can reach. A child `Untyped`'s own origin
+/// is on the `Untyped` itself.
+#[derive(Clone, Copy)]
+pub struct Origins {
+    pub cnodes: [Option<UntypedId>; MAX_CNODES],
+    pub tcbs: [Option<UntypedId>; MAX_TCBS],
+    pub endpoints: [Option<UntypedId>; MAX_ENDPOINTS],
+    pub notifications: [Option<UntypedId>; MAX_NOTIFICATIONS],
+    pub sched_contexts: [Option<UntypedId>; MAX_SCHED_CONTEXTS],
+    pub vspaces: [Option<UntypedId>; MAX_VSPACES],
+    pub frames: [Option<UntypedId>; MAX_FRAMES],
+}
+
+impl Origins {
+    pub const fn new() -> Self {
+        Self {
+            cnodes: [None; MAX_CNODES],
+            tcbs: [None; MAX_TCBS],
+            endpoints: [None; MAX_ENDPOINTS],
+            notifications: [None; MAX_NOTIFICATIONS],
+            sched_contexts: [None; MAX_SCHED_CONTEXTS],
+            vspaces: [None; MAX_VSPACES],
+            frames: [None; MAX_FRAMES],
+        }
+    }
+}
+
+impl Default for Origins {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl KernelState {
@@ -74,6 +115,10 @@ impl KernelState {
             timer_owner: None,
             slice_end: 0,
             timer_armed: u64::MAX,
+            deadlines: Pool::new(),
+            now: 0,
+            kernel_template: crate::vspace::Template::new(),
+            origins: Origins::new(),
         }
     }
 
@@ -187,8 +232,23 @@ pub(crate) fn activate_if_paged(tcb: &Tcb) {
         // `lantern-boot`, which owns physical-memory/page-table construction) to
         // have built a valid table there.
         unsafe { Hardware::activate_address_space(root) };
+        ACTIVE_ROOT.store(root, core::sync::atomic::Ordering::Relaxed);
     }
 }
+
+/// After any change to the page table at `root`: if the hart is running on it, re-activates it, which flushes the TLB
+/// (`sfence.vma`). Without that, a page just unmapped stays reachable through a cached translation, and a page just mapped
+/// may not be seen. Every other table is flushed when it's next activated.
+pub(crate) fn flush_if_active(root: usize) {
+    if root != 0 && ACTIVE_ROOT.load(core::sync::atomic::Ordering::Relaxed) == root {
+        // SAFETY: it's the table the hart is already running on, so it's valid and maps the kernel.
+        unsafe { Hardware::activate_address_space(root) };
+    }
+}
+
+/// The VSpace root this hart is running on, or 0 before paging is on. `crate::reclaim` must never free it while it's in use:
+/// the kernel's own code is mapped through it.
+pub(crate) static ACTIVE_ROOT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 impl Default for KernelState {
     fn default() -> Self {

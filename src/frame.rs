@@ -159,6 +159,7 @@ fn map(
     // ones are the most recent allocations, and nothing has written to them.
     state.kernel_page_tables.release_last(max_new_tables - next_spare);
 
+    crate::state::flush_if_active(root as usize);
     let f = state.frames.get_mut(frame_id.0 as usize).expect("checked above");
     f.mapped_at[free_slot] = Some((vspace_id, vaddr));
     Ok(())
@@ -185,6 +186,9 @@ fn unmap(state: &mut KernelState, current: TcbId, frame_id: FrameId, frame: &Tra
     let root = vspace.root as *mut lantern_hal::Riscv64PageTable;
     // SAFETY: as `map`'s — `root` is a valid Sv39 root page table.
     unsafe { lantern_hal::riscv64_unmap(root, vaddr) };
+    // Before returning to a program that may be running on this table: until the flush, the hart can still reach the
+    // page through a cached translation.
+    crate::state::flush_if_active(root as usize);
 
     let f = state.frames.get_mut(frame_id.0 as usize).expect("checked above");
     f.mapped_at[slot] = None;

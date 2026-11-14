@@ -164,6 +164,10 @@ pub struct Tcb {
     /// no address space, a switch never calls `Hal::activate_address_space` at
     /// all, not even the `x86-64` no-op.
     pub address_space: Option<usize>,
+    /// [RFC-0030](../../lantern-rfcs/rfcs/0030-process-lifecycle-faults-and-reclamation.md): where a fault is reported,
+    /// and the last fault, as `(cause, value)`. A thread that faults is `Inactive` and is never resumed.
+    pub fault_notification: Option<(crate::cap::NotificationId, u64)>,
+    pub fault: Option<(usize, usize)>,
 }
 
 impl Tcb {
@@ -175,6 +179,8 @@ impl Tcb {
             context: SavedContext::zeroed(),
             reply_to: None,
             address_space: None,
+            fault_notification: None,
+            fault: None,
         }
     }
 }
@@ -262,17 +268,44 @@ impl Default for Notification {
 pub struct Untyped {
     pub remaining: usize,
     memory: Option<(usize, usize)>,
+    /// [RFC-0030](../../lantern-rfcs/rfcs/0030-process-lifecycle-faults-and-reclamation.md): where the range starts and the
+    /// budget it started with, so `Reset` can rewind both; whether it's a device's memory, which is never zeroed on retype;
+    /// and the `Untyped` it was carved from, if any.
+    base: usize,
+    budget: usize,
+    pub device: bool,
+    pub origin: Option<crate::cap::UntypedId>,
 }
 
 impl Untyped {
     pub const fn new(budget: usize) -> Self {
-        Self { remaining: budget, memory: None }
+        Self { remaining: budget, memory: None, base: 0, budget, device: false, origin: None }
     }
 
     /// A budget additionally backed by a real physical range `[base, base + len)`
     /// — see this struct's doc. `lantern-boot` is the only expected caller.
     pub const fn with_memory(budget: usize, base: usize, len: usize) -> Self {
-        Self { remaining: budget, memory: Some((base, base + len)) }
+        Self { remaining: budget, memory: Some((base, base + len)), base, budget, device: false, origin: None }
+    }
+
+    /// [`Self::with_memory`], for a device's registers or memory: Frames retyped from it are never zeroed, since writing to
+    /// a device is not clearing it.
+    pub const fn device(budget: usize, base: usize, len: usize) -> Self {
+        Self { remaining: budget, memory: Some((base, base + len)), base, budget, device: true, origin: None }
+    }
+
+    /// The budget it started with.
+    pub fn budget(&self) -> usize {
+        self.budget
+    }
+
+    /// Empties it: every byte and the whole budget are available again. Only `crate::reclaim` calls this, once everything
+    /// made from it is gone.
+    pub fn rewind(&mut self) {
+        if let Some((_, end)) = self.memory {
+            self.memory = Some((self.base, end));
+        }
+        self.remaining = self.budget;
     }
 
     /// Bump-allocates one `size`-byte, `align`-aligned chunk of real physical
@@ -365,11 +398,20 @@ pub struct VSpace {
 pub struct KernelPageTables {
     bytes: [u8; crate::limits::MAX_KERNEL_PAGE_TABLES * lantern_hal::RISCV64_PAGE_SIZE],
     next: usize,
+    /// Pages given back by [`Self::free`], reused before bumping further
+    /// ([RFC-0030](../../lantern-rfcs/rfcs/0030-process-lifecycle-faults-and-reclamation.md)).
+    freed: [usize; crate::limits::MAX_KERNEL_PAGE_TABLES],
+    freed_len: usize,
 }
 
 impl KernelPageTables {
     pub const fn new() -> Self {
-        Self { bytes: [0; crate::limits::MAX_KERNEL_PAGE_TABLES * lantern_hal::RISCV64_PAGE_SIZE], next: 0 }
+        Self {
+            bytes: [0; crate::limits::MAX_KERNEL_PAGE_TABLES * lantern_hal::RISCV64_PAGE_SIZE],
+            next: 0,
+            freed: [0; crate::limits::MAX_KERNEL_PAGE_TABLES],
+            freed_len: 0,
+        }
     }
 
     /// Gives back the `count` most recent [`Self::alloc`]s. The caller must not have
@@ -377,6 +419,30 @@ impl KernelPageTables {
     /// be the most recent allocator.
     pub fn release_last(&mut self, count: usize) {
         self.next -= count * lantern_hal::RISCV64_PAGE_SIZE;
+    }
+
+    /// Gives back one page from [`Self::alloc`], zeroed, so `alloc`'s zeroed-page contract holds when it's reused. A page
+    /// this pool didn't hand out is ignored.
+    pub fn free(&mut self, addr: usize) {
+        let base = self.bytes.as_ptr() as usize;
+        let size = lantern_hal::RISCV64_PAGE_SIZE;
+        if addr < base || addr >= base + self.next || !(addr - base).is_multiple_of(size) || self.freed_len == self.freed.len() {
+            return;
+        }
+        let offset = addr - base;
+        self.bytes[offset..offset + size].fill(0);
+        self.freed[self.freed_len] = addr;
+        self.freed_len += 1;
+    }
+
+    /// How many more pages [`Self::alloc`] can hand out.
+    pub fn available(&self) -> usize {
+        (self.bytes.len() - self.next) / lantern_hal::RISCV64_PAGE_SIZE + self.freed_len
+    }
+
+    /// How many pages are in use: handed out and not given back.
+    pub fn in_use(&self) -> usize {
+        self.next / lantern_hal::RISCV64_PAGE_SIZE - self.freed_len
     }
 
     /// Bump-allocates one fresh, zeroed, page-aligned physical page — a
@@ -387,6 +453,10 @@ impl KernelPageTables {
     /// matches every other bump discipline in this project (`Untyped::bump`,
     /// `lantern-abi`'s `BumpAlloc`).
     pub fn alloc(&mut self) -> Option<usize> {
+        if self.freed_len > 0 {
+            self.freed_len -= 1;
+            return Some(self.freed[self.freed_len]);
+        }
         let size = lantern_hal::RISCV64_PAGE_SIZE;
         if self.next.checked_add(size)? > self.bytes.len() {
             return None;
@@ -462,6 +532,16 @@ impl IrqHandler {
     pub const fn new(line: u16) -> Self {
         Self { line, notification: None, pending: false }
     }
+}
+
+/// A one-shot deadline — [RFC-0028](../../lantern-rfcs/rfcs/0028-deadlines-and-a-capability-clock.md). When the monotonic
+/// clock reaches `at`, the kernel signals `notification` once and disarms it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Deadline {
+    /// The notification, and the badge bits expiry ORs into it. Nonzero, as for an `IrqHandler`.
+    pub notification: Option<(crate::cap::NotificationId, u64)>,
+    /// Armed for this monotonic time, in ns.
+    pub at: Option<u64>,
 }
 
 #[cfg(test)]
