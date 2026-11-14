@@ -52,13 +52,16 @@ pub mod error;
 pub mod frame;
 pub mod ipc;
 pub mod irq;
+pub mod lifecycle;
 pub mod limits;
 pub mod object;
 pub mod pool;
 pub mod queue;
+pub mod reclaim;
 pub mod scheduler;
 pub mod state;
 pub mod syscall;
+pub mod vspace;
 
 pub use error::SyscallError;
 pub use syscall::{dispatch, SyscallNumber};
@@ -99,6 +102,7 @@ pub fn handle_trap<H: lantern_hal::Hal>(state: &mut state::KernelState, frame: &
     match cause {
         TrapCause::Syscall => syscall::dispatch(state, frame),
         TrapCause::ExternalInterrupt => claim_pending::<H>(state),
+        TrapCause::Fault { cause, value } => lifecycle::fault(state, frame, cause, value),
         TrapCause::TimerInterrupt => {
             state.timer_armed = u64::MAX;
             if state.now >= state.slice_end {
@@ -288,6 +292,9 @@ mod tests {
         }
         fn timer_pending() -> bool {
             fake(|f| f.timer_pending)
+        }
+        fn ram_window(paddr: usize, _len: usize) -> Option<usize> {
+            Some(paddr)
         }
         fn wait_for_interrupt() {
             fake(|f| {

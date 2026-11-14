@@ -18,10 +18,10 @@ use lantern_hal::TrapFrame;
 use crate::abi;
 use crate::cap::{
     Capability, CNode, CPtr, EndpointId, FrameId, NotificationId, ObjectType, Rights, SchedContextId,
-    TcbId, VSpaceId,
+    TcbId, UntypedId, VSpaceId,
 };
 use crate::error::SyscallError;
-use crate::object::{Endpoint, Frame, FrameSize, Notification, SchedulingContext, Tcb, ThreadState, VSpace};
+use crate::object::{Endpoint, Frame, FrameSize, Notification, SchedulingContext, Tcb, ThreadState, Untyped, VSpace};
 use crate::state::KernelState;
 
 /// Carves one new typed object out of an Untyped capability's budget and places a
@@ -100,24 +100,54 @@ pub fn untyped_retype(
             // range — see `crate::object::KernelPageTables`'s doc. `untyped`'s
             // count budget (below, unconditionally) still gates this.
             let root = state.kernel_page_tables.alloc().ok_or(SyscallError::NotEnoughMemory)?;
-            let idx = state.vspaces.alloc(VSpace { root }).ok_or(SyscallError::NotEnoughMemory)?;
+            // RFC-0030: every VSpace gets the kernel's own mappings, so a process built from user space traps into the
+            // kernel like one built at boot. A failure gives back whatever was taken, root included.
+            let populated = crate::vspace::populate(state, root);
+            let idx = populated.ok().and_then(|()| state.vspaces.alloc(VSpace { root }));
+            let Some(idx) = idx else {
+                crate::vspace::free_tables(state, root);
+                return Err(SyscallError::NotEnoughMemory);
+            };
             Capability::VSpace { id: VSpaceId(idx as u16), rights: Rights::ALL }
         }
         ObjectType::FrameSmall | ObjectType::FrameMega => {
             let size = if object_type == ObjectType::FrameSmall { FrameSize::Small } else { FrameSize::Mega };
             let untyped = state.untypeds.get_mut(untyped_id.0 as usize).expect("checked above");
+            let device = untyped.device;
             let paddr = untyped.bump(size.bytes(), size.bytes()).ok_or(SyscallError::NotEnoughMemory)?;
+            // RFC-0030: no program is ever handed another's old memory. RAM is zeroed here, by the kernel, whoever holds
+            // the Untyped; a device's memory is never written.
+            if !device {
+                let window = ram_window(paddr, size.bytes()).ok_or(SyscallError::InvalidArgument)?;
+                // SAFETY: `window` addresses exactly this Frame's freshly bumped RAM, which nothing maps or holds yet.
+                unsafe { core::ptr::write_bytes(window as *mut u8, 0, size.bytes()) };
+            }
             let idx = state
                 .frames
                 .alloc(Frame { paddr, size, mapped_at: [None; crate::object::MAX_FRAME_MAPPINGS] })
                 .ok_or(SyscallError::NotEnoughMemory)?;
+            state.origins.frames[idx] = Some(untyped_id);
             Capability::Frame { id: FrameId(idx as u16), rights: Rights::ALL }
         }
-        // Untyped isn't a valid retype *target* (there's nothing to split a
-        // count-based budget into) — matches seL4, where Untyped is always the
-        // retype source, never the requested output type.
-        ObjectType::Untyped => return Err(SyscallError::InvalidArgument),
+        // RFC-0030: a child `Untyped`, `mr3` bytes carved from this one's memory, megapage-aligned. It's what a launcher
+        // gives each app, so that `Reset` on it reclaims exactly that app.
+        ObjectType::Untyped => {
+            let size = frame.mr(3);
+            let mega = lantern_hal::RISCV64_MEGAPAGE_SIZE;
+            if size == 0 || !size.is_multiple_of(mega) {
+                return Err(SyscallError::InvalidArgument);
+            }
+            let parent = state.untypeds.get_mut(untyped_id.0 as usize).expect("checked above");
+            let (device, budget) = (parent.device, parent.budget());
+            let base = parent.bump(size, mega).ok_or(SyscallError::NotEnoughMemory)?;
+            let mut child =
+                if device { Untyped::device(budget, base, size) } else { Untyped::with_memory(budget, base, size) };
+            child.origin = Some(untyped_id);
+            let idx = state.untypeds.alloc(child).ok_or(SyscallError::NotEnoughMemory)?;
+            Capability::Untyped { id: UntypedId(idx as u16), rights: Rights::ALL }
+        }
     };
+    record_origin(state, &new_cap, untyped_id);
 
     // Neither of these can fail now: the destination slot was checked empty above
     // and nothing else could have touched it since (single-stack, non-reentrant —
@@ -128,6 +158,36 @@ pub fn untyped_retype(
 
     abi::reply_success(frame);
     Ok(())
+}
+
+/// Records which `Untyped` a freshly retyped object came from, so a `Reset` on it can find it. Frames and child `Untyped`s
+/// record theirs as they're made.
+fn record_origin(state: &mut KernelState, cap: &Capability, untyped: UntypedId) {
+    let origins = &mut state.origins;
+    match *cap {
+        Capability::CNode(id) => origins.cnodes[id.0 as usize] = Some(untyped),
+        Capability::Endpoint { id, .. } => origins.endpoints[id.0 as usize] = Some(untyped),
+        Capability::Notification { id, .. } => origins.notifications[id.0 as usize] = Some(untyped),
+        Capability::Tcb { id, .. } => origins.tcbs[id.0 as usize] = Some(untyped),
+        Capability::SchedContext { id, .. } => origins.sched_contexts[id.0 as usize] = Some(untyped),
+        Capability::VSpace { id, .. } => origins.vspaces[id.0 as usize] = Some(untyped),
+        _ => {}
+    }
+}
+
+/// Where the kernel can write a RAM page right now. On the host, where tests use their own memory as "physical", that's
+/// the address itself.
+fn ram_window(paddr: usize, len: usize) -> Option<usize> {
+    #[cfg(target_arch = "riscv64")]
+    {
+        use lantern_hal::Hal;
+        lantern_hal::Hardware::ram_window(paddr, len)
+    }
+    #[cfg(not(target_arch = "riscv64"))]
+    {
+        let _ = len;
+        Some(paddr)
+    }
 }
 
 /// Sets a thread's CSpace root, scheduling context, and (optionally) VSpace root,

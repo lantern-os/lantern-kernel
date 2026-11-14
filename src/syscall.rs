@@ -38,6 +38,9 @@ pub enum SyscallNumber {
     /// [RFC-0028](../../lantern-rfcs/rfcs/0028-deadlines-and-a-capability-clock.md): `SET_NOTIFICATION`, `ARM`, `CANCEL`,
     /// `NOW` on a `Deadline`, by the tag's label ([`crate::deadline`]).
     DeadlineInvoke = 15,
+    /// [RFC-0030](../../lantern-rfcs/rfcs/0030-process-lifecycle-faults-and-reclamation.md): `SET_ENTRY`,
+    /// `SET_FAULT_NOTIFICATION`, `READ_FAULT` on a `Tcb`, by the tag's label ([`crate::lifecycle`]).
+    TcbInvoke = 16,
 }
 
 impl SyscallNumber {
@@ -58,6 +61,7 @@ impl SyscallNumber {
             13 => Self::FrameInvoke,
             14 => Self::IrqHandlerInvoke,
             15 => Self::DeadlineInvoke,
+            16 => Self::TcbInvoke,
             _ => return None,
         })
     }
@@ -112,6 +116,7 @@ pub fn dispatch(state: &mut KernelState, frame: &mut TrapFrame) {
         SyscallNumber::FrameInvoke => crate::frame::invoke(state, current, cptr, frame),
         SyscallNumber::IrqHandlerInvoke => crate::irq::invoke(state, current, cptr, frame),
         SyscallNumber::DeadlineInvoke => crate::deadline::invoke(state, current, cptr, frame),
+        SyscallNumber::TcbInvoke => crate::lifecycle::invoke(state, current, cptr, frame),
         SyscallNumber::Yield => {
             yield_now(state, current, frame);
             Ok(())

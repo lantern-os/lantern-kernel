@@ -112,6 +112,21 @@ pub fn invoke(state: &mut KernelState, current: TcbId, cptr: CPtr, frame: &mut T
     Ok(())
 }
 
+/// RFC-0030: a notification has gone, so every handler bound to it is unbound, and a line it held claimed is completed.
+pub(crate) fn unbind_notification(state: &mut KernelState, gone: crate::cap::NotificationId) {
+    for index in 0..MAX_IRQ_HANDLERS {
+        let Some(handler) = state.irq_handlers.get(index).copied() else { continue };
+        if handler.notification.is_some_and(|(n, _)| n == gone) {
+            let line = handler.line as u32;
+            queue(state, &[IrqAction::Disable(line)]);
+            if handler.pending {
+                queue(state, &[IrqAction::Complete(line)]);
+            }
+            *state.irq_handlers.get_mut(index).expect("present") = IrqHandler::new(handler.line);
+        }
+    }
+}
+
 fn queue(state: &mut KernelState, actions: &[IrqAction]) {
     for &action in actions {
         // Bounded by `MAX_IRQ_ACTIONS`, and drained after every trap. Losing one would leave a line claimed or

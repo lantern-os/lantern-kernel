@@ -17,7 +17,7 @@ pub const MAX_CNODES: usize = 7;
 pub const MAX_TCBS: usize = 8;
 pub const MAX_ENDPOINTS: usize = 8;
 pub const MAX_NOTIFICATIONS: usize = 8;
-pub const MAX_UNTYPEDS: usize = 4;
+pub const MAX_UNTYPEDS: usize = 16;
 pub const MAX_SCHED_CONTEXTS: usize = 8;
 pub const MAX_VSPACES: usize = 6;
 /// System-wide, at megapage granularity (`lantern-boot/STATUS.md`): dozens of 2 MiB

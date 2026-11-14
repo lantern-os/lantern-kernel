@@ -176,9 +176,9 @@ runs.
   memory map — `lantern-boot` doesn't parse the DTB yet. `VSpace`/`Frame*` retype now *does*
   consume real memory (see "Done" above), but from a single hardcoded range
   `lantern-boot/pmm.rs` seeds at boot, not real discovery.
-- `Revoke` is cleanly refused (`IllegalOperation`), not implemented — needs a
-  capability-derivation tree; `Delete` doesn't reclaim the underlying pooled object either
-  (no refcounting yet).
+- A general `Revoke` is still refused (`IllegalOperation`): there's no capability-derivation tree. On an `Untyped` it is
+  `Reset` ([RFC-0030](../lantern-rfcs/rfcs/0030-process-lifecycle-faults-and-reclamation.md)/[ADR-0034](../lantern-rfcs/adr/0034-process-lifecycle-faults-and-reclamation.md)), which destroys everything made from it. `Delete` still only clears a slot.
+- `Reset` is one non-preemptible call, bounded by the pool sizes, not capped per call or resumable.
 - **Limits raised again for [RFC-0022](../lantern-rfcs/rfcs/0022-persistent-revocation-store.md)/[ADR-0027](../lantern-rfcs/adr/0027-persistent-revocation-store.md) (2026-11-03).** `MAX_FRAMES` 28, `MAX_CNODES` 7, `MAX_VSPACES` 6, `CNODE_SLOTS` 72.
   Measured in `runtime-fs-demo` at launch: 27 Frames, 7 CNodes, 6 VSpaces, 64 root slots. No kernel mechanism changed: a
   device Frame is an ordinary `FrameMega` retyped from an `Untyped` the launcher seeds over a device range.
@@ -280,12 +280,33 @@ runs.
   (e.g. a service linked at `BASE_ADDRESS = 0x8400_0000`); moving the *backing* rather than
   relinking every program's own layout avoided that collision entirely.
 
+- **Process lifecycle, faults and reclamation (2026-11-13, [RFC-0030](../lantern-rfcs/rfcs/0030-process-lifecycle-faults-and-reclamation.md)/[ADR-0034](../lantern-rfcs/adr/0034-process-lifecycle-faults-and-reclamation.md)).** A program can now build a
+  process from an `Untyped` through system calls alone, a fault ends only the faulting program, and `Reset` reclaims
+  everything made from an `Untyped`.
+  - **Building:** `vspace.rs`'s kernel-mapping template, which every VSpace retype installs, with a direct map of RAM in one
+    shared root entry. `TcbInvoke` is syscall 16: `SetEntry`, `SetFaultNotification` and `ReadFault`, in `lifecycle.rs`.
+  - **Faults:** the thread is suspended for good, its fault recorded, a caller it owed a reply failed, and its fault
+    notification signalled.
+  - **Reclamation:** child `Untyped`s, and every object's origin. `MAX_UNTYPEDS` grows from 4 to 16. `Revoke` on an
+    `Untyped` is `Reset` (`reclaim.rs`), and the page-table pool has a free list.
+  - **Memory:** every RAM Frame is zeroed through the direct map on retype.
+  - **Found and fixed:** `FrameInvoke::Map`/`Unmap` never flushed the TLB, so a page a program unmapped from its own
+    VSpace stayed reachable. They now re-activate the running table when they change it (`state::flush_if_active`).
+
+  99 tests, 9 of them on `Reset`. Under QEMU, `lantern-boot-lifecycle-demo` builds 40 children through a confined nursery.
+  A slot `Reset` takes 30–50 µs, and a whole-memory one 45–60 µs. Mutation-tested against the demo:
+  - a stale capability left behind;
+  - a TCB slot or page tables not freed;
+  - an `Untyped` not rewound;
+  - a fault that parks the hart;
+  - no TLB flush;
+  - no zeroing.
+
+  Each fails it.
 ## Next
-- The capability-derivation tree `Revoke`/proper `Delete` reclaim need — more pressing in
-  Phase 3: [RFC-0018](../lantern-rfcs/rfcs/0018-confined-execution-port.md) (Accepted;
-  [ADR-0022](../lantern-rfcs/adr/0022-confined-service-model-and-call-transport.md)/[ADR-0023](../lantern-rfcs/adr/0023-wasmtime-no-std-pulley-hosting.md))
-  needs real `Revoke` for "a revocable capability set" on a still-running app; it does not
-  block that work's v0 (tear the process down instead).
+- Pools sized for [RFC-0029](../lantern-rfcs/rfcs/0029-a-confined-launcher.md)'s launcher: the system image plus 4 apps.
+- A general `Revoke` over a derivation tree, if a need appears that `Untyped` origins can't meet. Tearing a process down
+  with `Reset` covers apps today.
 - A user-space time service to multiplex and coarsen the clock; wall-clock time (RFC-0028's future possibilities).
 - RFC-0010's kernel-side scope is now fully implemented (outbound transfer, `CopyCross`,
   reply-leg transfer). `lantern-capabilities`' `Broker` (see its own `STATUS.md`) still
