@@ -174,10 +174,15 @@ mod tests {
     }
 
     #[test]
-    fn rights_and_badges_are_checked() {
+    fn rights_are_checked() {
         let (mut state, parent, _, _) = setup(Rights::READ);
         assert_eq!(call(&mut state, parent, LABEL_SET_ENTRY, [0, 0, 0]), Err(SyscallError::IllegalOperation));
         assert_eq!(call(&mut state, parent, LABEL_READ_FAULT, [0, 0, 0]), Ok([0, 0]));
+    }
+
+    // One `KernelState` per test: a debug build keeps several copies of it on the stack.
+    #[test]
+    fn badges_and_labels_are_checked() {
         let (mut state, parent, _, notification) = setup(Rights::ALL);
         let cnode = state.tcbs.get(parent.0 as usize).unwrap().cspace.unwrap();
         *state.cnodes.get_mut(cnode.0 as usize).unwrap().slot_mut(NOTIFICATION_CPTR).unwrap() =

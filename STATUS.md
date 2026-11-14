@@ -179,6 +179,10 @@ runs.
 - A general `Revoke` is still refused (`IllegalOperation`): there's no capability-derivation tree. On an `Untyped` it is
   `Reset` ([RFC-0030](../lantern-rfcs/rfcs/0030-process-lifecycle-faults-and-reclamation.md)/[ADR-0034](../lantern-rfcs/adr/0034-process-lifecycle-faults-and-reclamation.md)), which destroys everything made from it. `Delete` still only clears a slot.
 - `Reset` is one non-preemptible call, bounded by the pool sizes, not capped per call or resumable.
+- **Limits raised for [RFC-0029](../lantern-rfcs/rfcs/0029-a-confined-launcher.md)/[ADR-0035](../lantern-rfcs/adr/0035-a-confined-launcher.md) (2026-11-14):** the system image plus 4 apps. `MAX_TCBS`, `MAX_CNODES`,
+  `MAX_VSPACES`, `MAX_SCHED_CONTEXTS` and `MAX_NOTIFICATIONS` are 12, `MAX_FRAMES` 80, `MAX_KERNEL_PAGE_TABLES` 64, and
+  `CNODE_SLOTS` 128. See `src/limits.rs` for what was measured. `KernelState` is now about 300 KB, so a host test keeps one
+  per function: a debug build holds several copies of a moved one on the stack, and two overflowed a test thread's 2 MiB.
 - **Limits raised again for [RFC-0022](../lantern-rfcs/rfcs/0022-persistent-revocation-store.md)/[ADR-0027](../lantern-rfcs/adr/0027-persistent-revocation-store.md) (2026-11-03).** `MAX_FRAMES` 28, `MAX_CNODES` 7, `MAX_VSPACES` 6, `CNODE_SLOTS` 72.
   Measured in `runtime-fs-demo` at launch: 27 Frames, 7 CNodes, 6 VSpaces, 64 root slots. No kernel mechanism changed: a
   device Frame is an ordinary `FrameMega` retyped from an `Untyped` the launcher seeds over a device range.
