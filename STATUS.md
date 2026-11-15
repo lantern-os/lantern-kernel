@@ -307,6 +307,10 @@ runs.
   - no zeroing.
 
   Each fails it.
+- **DMA addresses (2026-11-14, [RFC-0031](../lantern-rfcs/rfcs/0031-storage-a-block-driver-and-the-store-on-disk.md)/[ADR-0036](../lantern-rfcs/adr/0036-storage-a-block-driver-and-the-store-on-disk.md)).** Boot can mark an `Untyped` for DMA (`Untyped::dma`), and its children inherit
+  it. `FrameInvoke::Address` (label 3) returns a Frame's physical address only for a Frame retyped from one. 102 tests.
+  Pools grew again for the system image's driver and volume (see `src/limits.rs`). Host tests now run with an 8 MiB stack
+  (`.cargo/config.toml`'s `RUST_MIN_STACK`), since `KernelState` is about 470 KB.
 ## Next
 - Pools sized for [RFC-0029](../lantern-rfcs/rfcs/0029-a-confined-launcher.md)'s launcher: the system image plus 4 apps.
 - A general `Revoke` over a derivation tree, if a need appears that `Untyped` origins can't meet. Tearing a process down

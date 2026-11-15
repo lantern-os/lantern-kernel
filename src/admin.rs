@@ -113,7 +113,7 @@ pub fn untyped_retype(
         ObjectType::FrameSmall | ObjectType::FrameMega => {
             let size = if object_type == ObjectType::FrameSmall { FrameSize::Small } else { FrameSize::Mega };
             let untyped = state.untypeds.get_mut(untyped_id.0 as usize).expect("checked above");
-            let device = untyped.device;
+            let (device, dma) = (untyped.device, untyped.dma);
             let paddr = untyped.bump(size.bytes(), size.bytes()).ok_or(SyscallError::NotEnoughMemory)?;
             // RFC-0030: no program is ever handed another's old memory. RAM is zeroed here, by the kernel, whoever holds
             // the Untyped; a device's memory is never written.
@@ -124,7 +124,7 @@ pub fn untyped_retype(
             }
             let idx = state
                 .frames
-                .alloc(Frame { paddr, size, mapped_at: [None; crate::object::MAX_FRAME_MAPPINGS] })
+                .alloc(Frame { paddr, size, mapped_at: [None; crate::object::MAX_FRAME_MAPPINGS], dma })
                 .ok_or(SyscallError::NotEnoughMemory)?;
             state.origins.frames[idx] = Some(untyped_id);
             Capability::Frame { id: FrameId(idx as u16), rights: Rights::ALL }
@@ -138,11 +138,12 @@ pub fn untyped_retype(
                 return Err(SyscallError::InvalidArgument);
             }
             let parent = state.untypeds.get_mut(untyped_id.0 as usize).expect("checked above");
-            let (device, budget) = (parent.device, parent.budget());
+            let (device, dma, budget) = (parent.device, parent.dma, parent.budget());
             let base = parent.bump(size, mega).ok_or(SyscallError::NotEnoughMemory)?;
             let mut child =
                 if device { Untyped::device(budget, base, size) } else { Untyped::with_memory(budget, base, size) };
             child.origin = Some(untyped_id);
+            child.dma = dma;
             let idx = state.untypeds.alloc(child).ok_or(SyscallError::NotEnoughMemory)?;
             Capability::Untyped { id: UntypedId(idx as u16), rights: Rights::ALL }
         }

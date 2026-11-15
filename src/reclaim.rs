@@ -477,6 +477,19 @@ mod tests {
     }
 
     #[test]
+    fn a_child_of_a_dma_untyped_is_dma_and_one_of_ordinary_memory_is_not() {
+        let ram = Ram::new();
+        let (mut state, launcher) = setup(&ram);
+        let Capability::Untyped { id: child, .. } = cap(&state, launcher, CHILD_CPTR) else { panic!() };
+        assert!(!state.untypeds.get(child.0 as usize).unwrap().dma);
+        let Capability::Untyped { id: root, .. } = cap(&state, launcher, ROOT_CPTR) else { panic!() };
+        state.untypeds.get_mut(root.0 as usize).unwrap().dma = true;
+        retype_sized(&mut state, launcher, ROOT_CPTR, 1, 3, MEGA).unwrap();
+        let Capability::Untyped { id: dma_child, .. } = cap(&state, launcher, 3) else { panic!() };
+        assert!(state.untypeds.get(dma_child.0 as usize).unwrap().dma);
+    }
+
+    #[test]
     fn boot_made_objects_have_no_origin_and_are_never_reached() {
         let ram = Ram::new();
         let (mut state, launcher) = setup(&ram);
