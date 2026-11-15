@@ -274,24 +274,28 @@ pub struct Untyped {
     base: usize,
     budget: usize,
     pub device: bool,
+    /// [RFC-0031](../../lantern-rfcs/rfcs/0031-storage-a-block-driver-and-the-store-on-disk.md): memory a device may be
+    /// told to reach. Only a Frame retyped from such an `Untyped` reveals its physical address (`FrameInvoke::Address`),
+    /// and only boot code sets this, for a driver's buffers.
+    pub dma: bool,
     pub origin: Option<crate::cap::UntypedId>,
 }
 
 impl Untyped {
     pub const fn new(budget: usize) -> Self {
-        Self { remaining: budget, memory: None, base: 0, budget, device: false, origin: None }
+        Self { remaining: budget, memory: None, base: 0, budget, device: false, dma: false, origin: None }
     }
 
     /// A budget additionally backed by a real physical range `[base, base + len)`
     /// — see this struct's doc. `lantern-boot` is the only expected caller.
     pub const fn with_memory(budget: usize, base: usize, len: usize) -> Self {
-        Self { remaining: budget, memory: Some((base, base + len)), base, budget, device: false, origin: None }
+        Self { remaining: budget, memory: Some((base, base + len)), base, budget, device: false, dma: false, origin: None }
     }
 
     /// [`Self::with_memory`], for a device's registers or memory: Frames retyped from it are never zeroed, since writing to
     /// a device is not clearing it.
     pub const fn device(budget: usize, base: usize, len: usize) -> Self {
-        Self { remaining: budget, memory: Some((base, base + len)), base, budget, device: true, origin: None }
+        Self { remaining: budget, memory: Some((base, base + len)), base, budget, device: true, dma: false, origin: None }
     }
 
     /// The budget it started with.
@@ -498,6 +502,8 @@ pub struct Frame {
     /// once. A slot is `None` when unused; `Map` fails with
     /// `IllegalOperation` once every slot is `Some`.
     pub mapped_at: [Option<(VSpaceId, usize)>; MAX_FRAME_MAPPINGS],
+    /// Retyped from a DMA `Untyped` ([`Untyped::dma`]): its holder may learn its physical address.
+    pub dma: bool,
 }
 
 /// Phase 1 scheduling context ([ADR-0009](../../lantern-rfcs/adr/0009-phase1-scheduling-context-model.md)):

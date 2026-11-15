@@ -15,18 +15,23 @@
 //! [RFC-0029](../../lantern-rfcs/rfcs/0029-a-confined-launcher.md) sized them for `lantern-boot-system` plus 4 apps. Before
 //! any app it takes 7 CNodes, 6 VSpaces, 7 TCBs, 36 Frames, 29 page tables and 104 root slots; each app adds a CNode, a
 //! VSpace, a TCB, a scheduling context, a notification and 8 Frames. `console-matrix.sh`'s hold case runs 4 at once. That
-//! makes `KernelState` about 300 KB, most of it the page tables. None of this is tuned for a real workload.
+//! makes `KernelState` about 300 KB, most of it the page tables.
+//!
+//! [RFC-0031](../../lantern-rfcs/rfcs/0031-storage-a-block-driver-and-the-store-on-disk.md) added the block driver and the
+//! volume, their channels, and the Frames the launcher and the binder read packages into. Before any app the image now
+//! takes 9 CNodes, 8 VSpaces, 9 TCBs, 53 Frames, 38 page tables and 136 root slots. `KernelState` is about 470 KB. None of
+//! this is tuned for a real workload.
 
-pub const MAX_CNODES: usize = 12;
-pub const MAX_TCBS: usize = 12;
+pub const MAX_CNODES: usize = 16;
+pub const MAX_TCBS: usize = 16;
 pub const MAX_ENDPOINTS: usize = 8;
-pub const MAX_NOTIFICATIONS: usize = 12;
+pub const MAX_NOTIFICATIONS: usize = 16;
 pub const MAX_UNTYPEDS: usize = 16;
-pub const MAX_SCHED_CONTEXTS: usize = 12;
-pub const MAX_VSPACES: usize = 12;
+pub const MAX_SCHED_CONTEXTS: usize = 16;
+pub const MAX_VSPACES: usize = 16;
 /// System-wide, at megapage granularity (`lantern-boot/STATUS.md`): dozens of 2 MiB
 /// Frames, not hundreds. See the module doc for how this was sized.
-pub const MAX_FRAMES: usize = 80;
+pub const MAX_FRAMES: usize = 112;
 /// Kernel-owned page tables (`crate::object::KernelPageTables`) — `VSpace`
 /// roots (bounded by [`MAX_VSPACES`]) plus the L1/L0 branch pages
 /// `FrameInvoke::Map` creates on demand, one 4 KiB page each. Generous for a
@@ -35,11 +40,11 @@ pub const MAX_FRAMES: usize = 80;
 /// `KernelState` (kernel `.bss`) — keep it well clear of the 2 MiB the
 /// kernel image's own linker script (`lantern-boot/linker.ld`) asserts the
 /// whole image must fit within.
-pub const MAX_KERNEL_PAGE_TABLES: usize = 64;
+pub const MAX_KERNEL_PAGE_TABLES: usize = 96;
 
 /// Capacity of a single (flat, single-level) CNode, per RFC-0005's CSpace simplification.
 /// Every CNode pays for this, though only the launcher's root needs this many.
-pub const CNODE_SLOTS: usize = 128;
+pub const CNODE_SLOTS: usize = 160;
 /// Interrupt lines bound to a driver at once ([RFC-0027](../../lantern-rfcs/rfcs/0027-interrupt-delivery-timer-and-idle.md)).
 /// The console needs one; storage and network will each need one more.
 pub const MAX_IRQ_HANDLERS: usize = 4;

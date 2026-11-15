@@ -1,0 +1,5 @@
+# Host tests build a whole `KernelState` (about 470 KB: fixed pools, most of it page tables), and a debug build keeps
+# several copies of a moved one on the stack, past a test thread's default 2 MiB. Test-only: the kernel itself runs on
+# its own stack, and holds its state in `.bss`.
+[env]
+RUST_MIN_STACK = "8388608"

@@ -29,6 +29,10 @@ pub const LABEL_MAP: u32 = 1;
 /// only this module's own tests do), so this is a clean ABI widening, not a
 /// break.
 pub const LABEL_UNMAP: u32 = 2;
+/// [RFC-0031](../../lantern-rfcs/rfcs/0031-storage-a-block-driver-and-the-store-on-disk.md): the Frame's physical address,
+/// in `mr1`, which a driver programs its device with. Only a Frame retyped from a DMA `Untyped` answers; any other is
+/// refused, so no other program learns where memory is.
+pub const LABEL_ADDRESS: u32 = 3;
 
 /// `mr3`'s bit layout for `Map` — see the module doc.
 #[derive(Clone, Copy)]
@@ -75,6 +79,16 @@ pub fn invoke(
     match frame.tag().label {
         LABEL_MAP => map(state, current, frame_id, frame)?,
         LABEL_UNMAP => unmap(state, current, frame_id, frame)?,
+        LABEL_ADDRESS => {
+            let f = state.frames.get(frame_id.0 as usize).ok_or(SyscallError::InvalidCapability)?;
+            if !f.dma {
+                return Err(SyscallError::IllegalOperation);
+            }
+            let paddr = f.paddr;
+            abi::reply_success(frame);
+            frame.set_mr(1, paddr);
+            return Ok(());
+        }
         _ => return Err(SyscallError::InvalidArgument),
     }
     abi::reply_success(frame);
@@ -477,5 +491,27 @@ mod tests {
         let mapped = state.frames.get(frame_id.0 as usize).unwrap().mapped_at;
         assert!(mapped.contains(&Some((vspace2_id, 0x2000_0000))), "the other mapping must survive");
         assert_eq!(mapped.iter().filter(|m| m.is_some()).count(), 1);
+    }
+
+    fn address(state: &mut KernelState, tcb: TcbId, cptr: CPtr) -> Result<usize, SyscallError> {
+        let mut frame = TrapFrame::zeroed();
+        frame.set_tag(MessageTag { label: LABEL_ADDRESS, length: 0, extra_caps: 0, flags: 0 });
+        invoke(state, tcb, cptr, &mut frame).map(|()| frame.mr(1))
+    }
+
+    #[test]
+    fn only_a_dma_frame_reveals_its_address() {
+        let mut arena = TestArena([0; 64 * 1024]);
+        let (mut state, tcb, frame_cptr, _) = setup(&mut arena);
+        assert_eq!(address(&mut state, tcb, frame_cptr), Err(SyscallError::IllegalOperation), "ordinary memory");
+        // The same Untyped, marked for DMA by boot: what's retyped from it now answers.
+        let Capability::Untyped { id, .. } = state.lookup_cap(tcb, 1).unwrap() else { panic!() };
+        state.untypeds.get_mut(id.0 as usize).unwrap().dma = true;
+        let mut retype = TrapFrame::zeroed();
+        retype.set_mr(1, ObjectType::FrameSmall as usize);
+        retype.set_mr(2, 4);
+        admin::untyped_retype(&mut state, tcb, 1, &mut retype).unwrap();
+        let Capability::Frame { id: frame, .. } = state.lookup_cap(tcb, 4).unwrap() else { panic!() };
+        assert_eq!(address(&mut state, tcb, 4), Ok(state.frames.get(frame.0 as usize).unwrap().paddr));
     }
 }
