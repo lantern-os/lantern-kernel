@@ -155,6 +155,19 @@
   Syscall 15. The timer is armed lazily for the earliest of every deadline and the slice's end, idle included, and the clock
   is read once per trap into `KernelState::now`. A host test caught idle leaving a pending timer uncleared, which would
   have made `wfi` return forever. 84 tests. The IPC benchmark is unchanged within its spread.
+- **Room for the inference service (2026-11-16, [RFC-0034](../lantern-rfcs/rfcs/0034-local-inference-and-a-file-assistant.md)/[ADR-0039](../lantern-rfcs/adr/0039-local-inference-and-a-file-assistant.md)).** `CNODE_SLOTS` 160 to 192 and `MAX_FRAMES` 112 to 144: the
+  system image takes 168 root slots and 75 Frames before any app. No other kernel change.
+- **Found and fixed: `Yield` overwrote the next thread's tag register (2026-11-16).** `yield_now` switched threads and
+  then wrote its own success into `frame`, which by then held the next thread's registers: it cleared `FLAG_ERROR` in
+  that thread's `a4`. Every `BUSY` retry yields (`lantern_abi::frame::Channel::call`), so under load an app mid-calculation
+  now and then came back with one bit of `a4` changed: about one boot in four, an app started at once failed its own
+  package's signature check. Found during RFC-0035's work, with a reproducer that set every register to a pattern and
+  reported which changed. The result is now written before the switch. Kernel test
+  `yield_leaves_the_next_threads_registers_alone_and_answers_the_yielder`; 30 boots, 0 failures (8 of 30 before).
+- **A thread's floating-point registers are its own (2026-11-16).** With `lantern-hal`'s save area grown to 65 words,
+  `SavedContext` carries `f0..f31` and `fcsr` like any other register (`a_preempted_threads_registers_come_back_bit_for_bit`).
+- **Room for the network and the wallet (2026-11-16, [RFC-0035](../lantern-rfcs/rfcs/0035-pairwise-network-identities.md)/[ADR-0040](../lantern-rfcs/adr/0040-pairwise-network-identities.md)).** 24 CNodes, threads, VSpaces, scheduling contexts and
+  notifications; 16 endpoints; 176 Frames; 128 page tables; 256 CNode slots; 8 interrupt handlers. No other change.
 ## Validated under real QEMU
 [`lantern-boot`](../lantern-boot)'s loader (`src/loader.rs`, RFC-0008) drives a full
 `Call`→`Recv`→`Reply` round trip through real `riscv64` traps under `qemu-system-riscv64`,
