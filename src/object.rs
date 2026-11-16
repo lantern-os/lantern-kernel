@@ -8,10 +8,8 @@ use lantern_hal::{Hal, Hardware, MessageTag, TrapFrame, MR_COUNT};
 use crate::cap::{Capability, CNodeId, CPtr, NotificationId, SchedContextId, TcbId, VSpaceId};
 use crate::queue::ArrayQueue;
 
-/// Must match [`lantern_hal`]'s `TrapFrame::raw` word count. Not exported as a
-/// constant by `lantern-hal` today; if that array's size ever changes, this needs
-/// updating alongside it (tracked as a follow-up: export the constant instead).
-const RAW_WORDS: usize = 32;
+/// [`lantern_hal`]'s `TrapFrame::raw` word count.
+const RAW_WORDS: usize = lantern_hal::RAW_WORDS;
 
 /// A snapshot of a thread's register state — everything a [`TrapFrame`] carries,
 /// copied out of it. Needed because a blocked/ready thread's registers must live
@@ -570,5 +568,22 @@ mod tests {
         assert_eq!(other.tag(), MessageTag { label: 7, length: 1, extra_caps: 0, flags: 0 });
         assert_eq!(other.mr(0), 42);
         assert_eq!(other.raw_word(5), 99);
+    }
+
+    /// A preempted thread's registers come back exactly, its floating-point registers included, which once didn't.
+    #[test]
+    fn a_preempted_threads_registers_come_back_bit_for_bit() {
+        let mut frame = TrapFrame::zeroed();
+        frame.set_tag(MessageTag::from_raw(0xfedc_ba98_7654_3210));
+        for i in 0..lantern_hal::RAW_WORDS {
+            frame.set_raw_word(i, 0x0101_0101_0101_0101usize.wrapping_mul(i + 1));
+        }
+        let saved = SavedContext::save_from(&frame);
+        let mut other = TrapFrame::zeroed();
+        saved.restore_into(&mut other);
+        assert_eq!(other.tag().into_raw(), 0xfedc_ba98_7654_3210, "every bit of the tag register");
+        for i in 0..lantern_hal::RAW_WORDS {
+            assert_eq!(other.raw_word(i), frame.raw_word(i), "word {i}");
+        }
     }
 }

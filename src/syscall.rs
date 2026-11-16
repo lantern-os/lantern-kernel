@@ -72,12 +72,17 @@ impl SyscallNumber {
 /// thread means a solitary thread yielding with nothing else ready harmlessly
 /// resumes itself — Phase 1's stand-in for a real idle thread (see
 /// `lantern-kernel/STATUS.md`).
+///
+/// The yielder's result is written *before* the switch, so it's saved with the yielder. After the switch, `frame` holds
+/// whichever thread runs next, and writing a result there would overwrite that thread's tag register (`a4` on
+/// `riscv64`). That was a real bug until RFC-0035's work found it: every `BUSY` retry yielded, and the next thread,
+/// often an app in the middle of a calculation, came back with a different `a4`, and now and then a wrong answer.
 fn yield_now(state: &mut KernelState, current: crate::cap::TcbId, frame: &mut TrapFrame) {
+    abi::reply_success(frame);
     state.make_ready(current);
     // Just enqueued `current`, so the ready queue is never empty here.
     let switched = state.block_current(frame);
     debug_assert!(switched, "just enqueued current, so has_ready() must be true");
-    abi::reply_success(frame);
 }
 
 /// The real dispatch logic. Callers at the actual trap boundary go through
@@ -133,6 +138,37 @@ mod tests {
     use super::*;
     use crate::cap::{CNode, CNodeId, Capability, EndpointId, Rights, TcbId};
     use crate::object::Tcb;
+
+    /// A thread that yields to another must hand that thread its registers exactly as they were: the yielder's result
+    /// belongs to the yielder. It once landed in the next thread's tag register instead.
+    #[test]
+    fn yield_leaves_the_next_threads_registers_alone_and_answers_the_yielder() {
+        use crate::object::SavedContext;
+        use lantern_hal::MessageTag;
+        let mut state = KernelState::new();
+        let yielder = TcbId(state.tcbs.alloc(Tcb::new()).unwrap() as u16);
+        let other = TcbId(state.tcbs.alloc(Tcb::new()).unwrap() as u16);
+        // The other thread was preempted in the middle of something: its tag register holds an arbitrary value.
+        let mut busy = TrapFrame::zeroed();
+        busy.set_tag(MessageTag::from_raw(0x1234_5678_9abc_ffff));
+        busy.set_mr(0, 77);
+        busy.set_raw_word(5, 0xdead);
+        state.tcbs.get_mut(other.0 as usize).unwrap().context = SavedContext::save_from(&busy);
+        state.make_ready(other);
+        state.scheduler.current = Some(yielder);
+        state.tcbs.get_mut(yielder.0 as usize).unwrap().state = crate::object::ThreadState::Running;
+
+        let mut frame = TrapFrame::zeroed();
+        frame.set_syscall_number(12); // Yield
+        frame.set_tag(MessageTag::from_raw(0xffff));
+        dispatch(&mut state, &mut frame);
+
+        assert_eq!(state.scheduler.current, Some(other));
+        assert_eq!(frame.tag().into_raw(), 0x1234_5678_9abc_ffff, "the next thread's tag register, untouched");
+        assert_eq!((frame.mr(0), frame.raw_word(5)), (77, 0xdead));
+        let saved = state.tcbs.get(yielder.0 as usize).unwrap().context;
+        assert!(!saved.tag().is_error(), "the yielder's own result is saved with it");
+    }
 
     #[test]
     fn full_call_recv_reply_round_trip() {

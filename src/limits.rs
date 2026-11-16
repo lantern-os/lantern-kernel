@@ -21,17 +21,27 @@
 //! volume, their channels, and the Frames the launcher and the binder read packages into. Before any app the image now
 //! takes 9 CNodes, 8 VSpaces, 9 TCBs, 53 Frames, 38 page tables and 136 root slots. `KernelState` is about 470 KB. None of
 //! this is tuned for a real workload.
+//!
+//! [RFC-0034](../../lantern-rfcs/rfcs/0034-local-inference-and-a-file-assistant.md) added the inference service, its
+//! 12-megapage heap, its channels and the shell's channel to the store: before any app the image now takes 10 CNodes, 9
+//! VSpaces, 10 TCBs, 75 Frames, 43 page tables and 168 root slots, past the 160 slots a CNode had. `CNODE_SLOTS` is now
+//! 192 and `MAX_FRAMES` 144.
+//!
+//! [RFC-0035](../../lantern-rfcs/rfcs/0035-pairwise-network-identities.md) added four programs (the random-number and
+//! network drivers, the network service and the wallet): before any app the image takes 14 CNodes, 13 VSpaces, 14 TCBs,
+//! 95 Frames, 58 page tables and 228 root slots, with 11 endpoints. The pools were raised to 24/24/16/24/24/24/24, 176
+//! Frames, 128 page tables, 256 slots and 8 interrupt handlers.
 
-pub const MAX_CNODES: usize = 16;
-pub const MAX_TCBS: usize = 16;
-pub const MAX_ENDPOINTS: usize = 8;
-pub const MAX_NOTIFICATIONS: usize = 16;
-pub const MAX_UNTYPEDS: usize = 16;
-pub const MAX_SCHED_CONTEXTS: usize = 16;
-pub const MAX_VSPACES: usize = 16;
+pub const MAX_CNODES: usize = 24;
+pub const MAX_TCBS: usize = 24;
+pub const MAX_ENDPOINTS: usize = 16;
+pub const MAX_NOTIFICATIONS: usize = 24;
+pub const MAX_UNTYPEDS: usize = 24;
+pub const MAX_SCHED_CONTEXTS: usize = 24;
+pub const MAX_VSPACES: usize = 24;
 /// System-wide, at megapage granularity (`lantern-boot/STATUS.md`): dozens of 2 MiB
 /// Frames, not hundreds. See the module doc for how this was sized.
-pub const MAX_FRAMES: usize = 112;
+pub const MAX_FRAMES: usize = 176;
 /// Kernel-owned page tables (`crate::object::KernelPageTables`) — `VSpace`
 /// roots (bounded by [`MAX_VSPACES`]) plus the L1/L0 branch pages
 /// `FrameInvoke::Map` creates on demand, one 4 KiB page each. Generous for a
@@ -40,14 +50,14 @@ pub const MAX_FRAMES: usize = 112;
 /// `KernelState` (kernel `.bss`) — keep it well clear of the 2 MiB the
 /// kernel image's own linker script (`lantern-boot/linker.ld`) asserts the
 /// whole image must fit within.
-pub const MAX_KERNEL_PAGE_TABLES: usize = 96;
+pub const MAX_KERNEL_PAGE_TABLES: usize = 128;
 
 /// Capacity of a single (flat, single-level) CNode, per RFC-0005's CSpace simplification.
 /// Every CNode pays for this, though only the launcher's root needs this many.
-pub const CNODE_SLOTS: usize = 160;
+pub const CNODE_SLOTS: usize = 256;
 /// Interrupt lines bound to a driver at once ([RFC-0027](../../lantern-rfcs/rfcs/0027-interrupt-delivery-timer-and-idle.md)).
 /// The console needs one; storage and network will each need one more.
-pub const MAX_IRQ_HANDLERS: usize = 4;
+pub const MAX_IRQ_HANDLERS: usize = 8;
 /// Controller actions waiting for the trap glue to apply them, between two traps. Each `IrqHandlerInvoke` queues at
 /// most two, and each delivery two.
 pub const MAX_IRQ_ACTIONS: usize = 16;
