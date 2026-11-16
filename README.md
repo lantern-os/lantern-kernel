@@ -9,8 +9,9 @@ and nothing else.
 - **Decision of record:** [RFC-0002 — Microkernel architecture](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0002-microkernel-architecture.md).
 - **System context:** [wiki/Kernel](https://github.com/lantern-os/lantern-docs/blob/main/wiki/Kernel.md), [wiki/Architecture](https://github.com/lantern-os/lantern-docs/blob/main/wiki/Architecture.md).
 
-> ⚠️ **Phase 0.** No kernel code exists yet. This repository currently holds design
-> documents only. See [`STATUS.md`](./STATUS.md).
+> **Phase 4** ([RFC-0036](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0036-phase-3-to-phase-4-transition.md)): hardware and assurance. The kernel runs on QEMU `virt` (riscv64): capabilities and untyped retyping, IPC, preemptive
+> scheduling, interrupts, deadlines, and process reclamation, with every service confined above it. Formal verification
+> of its capability and IPC paths is Phase 4's first work. See [`STATUS.md`](./STATUS.md).
 
 ## In this repo
 - [`ARCHITECTURE.md`](./ARCHITECTURE.md) — the kernel's internal design.
