@@ -28,6 +28,7 @@ use crate::queue::ArrayQueue;
 use crate::pool::Pool;
 use crate::scheduler::Scheduler;
 
+#[cfg_attr(kani, derive(Clone))]
 pub struct KernelState {
     pub cnodes: Pool<CNode, MAX_CNODES>,
     pub tcbs: Pool<Tcb, MAX_TCBS>,
@@ -137,11 +138,11 @@ impl KernelState {
     /// real call sites (`ipc::call`, `ipc::reply`) satisfy this by construction.
     pub fn switch_to(&mut self, frame: &mut TrapFrame, next: TcbId) {
         self.save_current(frame);
-        if let Some(tcb) = self.tcbs.get_mut(next.0 as usize) {
+        self.tcbs.with_mut(next.0 as usize, |tcb| {
             tcb.context.restore_into(frame);
             tcb.state = ThreadState::Running;
             activate_if_paged(tcb);
-        }
+        });
         self.scheduler.current = Some(next);
     }
 
@@ -165,11 +166,11 @@ impl KernelState {
         let Some(next) = self.scheduler.ready.pop_front() else {
             return false;
         };
-        if let Some(tcb) = self.tcbs.get_mut(next.0 as usize) {
+        self.tcbs.with_mut(next.0 as usize, |tcb| {
             tcb.context.restore_into(frame);
             tcb.state = ThreadState::Running;
             activate_if_paged(tcb);
-        }
+        });
         self.scheduler.current = Some(next);
         true
     }
@@ -189,23 +190,21 @@ impl KernelState {
     }
 
     pub fn make_ready(&mut self, id: TcbId) {
-        if let Some(tcb) = self.tcbs.get_mut(id.0 as usize) {
-            if tcb.state == ThreadState::Ready {
-                return;
-            }
-            tcb.state = ThreadState::Ready;
+        let already = self
+            .tcbs
+            .with_mut(id.0 as usize, |tcb| core::mem::replace(&mut tcb.state, ThreadState::Ready) == ThreadState::Ready)
+            .unwrap_or(false);
+        if !already {
+            self.scheduler.ready.push_back(id);
         }
-        self.scheduler.ready.push_back(id);
     }
 
     /// Resolves `cptr` in `thread`'s CSpace. `FailedLookup` if `cptr` is out of
     /// range or the thread has no CSpace configured yet; `InvalidCapability` if the
     /// slot is empty.
     pub fn lookup_cap(&self, thread: TcbId, cptr: CPtr) -> Result<Capability, SyscallError> {
-        let tcb = self.tcbs.get(thread.0 as usize).ok_or(SyscallError::FailedLookup)?;
-        let cspace_id = tcb.cspace.ok_or(SyscallError::FailedLookup)?;
-        let cnode = self.cnodes.get(cspace_id.0 as usize).ok_or(SyscallError::FailedLookup)?;
-        match cnode.get(cptr) {
+        let cspace_id = self.tcbs.with(thread.0 as usize, |t| t.cspace).flatten().ok_or(SyscallError::FailedLookup)?;
+        match self.cnodes.with(cspace_id.0 as usize, |c| c.get(cptr)).ok_or(SyscallError::FailedLookup)? {
             Some(Capability::Null) | None => Err(SyscallError::InvalidCapability),
             Some(cap) => Ok(cap),
         }
@@ -213,9 +212,9 @@ impl KernelState {
 
     fn save_current(&mut self, frame: &TrapFrame) {
         if let Some(current) = self.scheduler.current {
-            if let Some(tcb) = self.tcbs.get_mut(current.0 as usize) {
+            self.tcbs.with_mut(current.0 as usize, |tcb| {
                 tcb.context = SavedContext::save_from(frame);
-            }
+            });
         }
     }
 }
@@ -292,9 +291,9 @@ mod tests {
     /// thread established use this instead of `switch_to` itself.
     fn make_current(state: &mut KernelState, id: TcbId) {
         state.scheduler.current = Some(id);
-        if let Some(tcb) = state.tcbs.get_mut(id.0 as usize) {
+        state.tcbs.with_mut(id.0 as usize, |tcb| {
             tcb.state = ThreadState::Running;
-        }
+        });
     }
 
     #[test]

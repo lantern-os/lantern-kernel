@@ -44,17 +44,17 @@ pub fn create(state: &mut KernelState, line: u16) -> Option<Capability> {
 }
 
 fn find(state: &KernelState, line: u32) -> Option<usize> {
-    (0..MAX_IRQ_HANDLERS).find(|&index| state.irq_handlers.get(index).is_some_and(|h| h.line as u32 == line))
+    (0..MAX_IRQ_HANDLERS).find(|&index| state.irq_handlers.with(index, |h| h.line as u32 == line).unwrap_or(false))
 }
 
 /// A line the controller just handed over. A bound, unacknowledged-free handler signals its notification and keeps
 /// the line claimed until `Ack`. Anything else is completed and disabled, so a line nobody handles goes quiet.
 pub fn deliver(state: &mut KernelState, line: u32) {
     if let Some(index) = find(state, line) {
-        let handler = *state.irq_handlers.get(index).expect("found above");
+        let handler = state.irq_handlers.with(index, |h| *h).expect("found above");
         match handler.notification {
             Some((notification, badge)) if !handler.pending && signal_notification(state, notification, badge).is_ok() => {
-                state.irq_handlers.get_mut(index).expect("found above").pending = true;
+                state.irq_handlers.with_mut(index, |h| h.pending = true).expect("found above");
                 return;
             }
             // Delivered and not yet acknowledged: the controller shouldn't have offered it again. Keep it claimed.
@@ -73,7 +73,7 @@ pub fn invoke(state: &mut KernelState, current: TcbId, cptr: CPtr, frame: &mut T
         Capability::IrqHandler { .. } => return Err(SyscallError::IllegalOperation),
         _ => return Err(SyscallError::InvalidCapability),
     };
-    let handler = *state.irq_handlers.get(id.0 as usize).ok_or(SyscallError::InvalidCapability)?;
+    let handler = state.irq_handlers.with(id.0 as usize, |x| *x).ok_or(SyscallError::InvalidCapability)?;
     let line = handler.line as u32;
     // Room is checked first, so a failed invocation changes nothing.
     if state.irq_actions.len() + 2 > state.irq_actions.capacity() {
@@ -107,7 +107,7 @@ pub fn invoke(state: &mut KernelState, current: TcbId, cptr: CPtr, frame: &mut T
         }
         _ => return Err(SyscallError::InvalidArgument),
     };
-    *state.irq_handlers.get_mut(id.0 as usize).expect("looked up above") = updated;
+    state.irq_handlers.with_mut(id.0 as usize, |h| *h = updated).expect("looked up above");
     abi::reply_success(frame);
     Ok(())
 }
@@ -115,14 +115,14 @@ pub fn invoke(state: &mut KernelState, current: TcbId, cptr: CPtr, frame: &mut T
 /// RFC-0030: a notification has gone, so every handler bound to it is unbound, and a line it held claimed is completed.
 pub(crate) fn unbind_notification(state: &mut KernelState, gone: crate::cap::NotificationId) {
     for index in 0..MAX_IRQ_HANDLERS {
-        let Some(handler) = state.irq_handlers.get(index).copied() else { continue };
+        let Some(handler) = state.irq_handlers.with(index, |x| *x) else { continue };
         if handler.notification.is_some_and(|(n, _)| n == gone) {
             let line = handler.line as u32;
             queue(state, &[IrqAction::Disable(line)]);
             if handler.pending {
                 queue(state, &[IrqAction::Complete(line)]);
             }
-            *state.irq_handlers.get_mut(index).expect("present") = IrqHandler::new(handler.line);
+            state.irq_handlers.with_mut(index, |h| *h = IrqHandler::new(handler.line)).expect("present");
         }
     }
 }

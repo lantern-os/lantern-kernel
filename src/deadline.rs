@@ -42,7 +42,7 @@ pub fn invoke(state: &mut KernelState, current: TcbId, cptr: CPtr, frame: &mut T
     if !rights.contains(needed) {
         return Err(SyscallError::IllegalOperation);
     }
-    let deadline = *state.deadlines.get(id.0 as usize).ok_or(SyscallError::InvalidCapability)?;
+    let deadline = state.deadlines.with(id.0 as usize, |x| *x).ok_or(SyscallError::InvalidCapability)?;
     let updated = match label {
         LABEL_SET_NOTIFICATION => {
             let (notification, badge) = match state.lookup_cap(current, frame.mr(1))? {
@@ -68,7 +68,7 @@ pub fn invoke(state: &mut KernelState, current: TcbId, cptr: CPtr, frame: &mut T
         }
         _ => return Err(SyscallError::InvalidArgument),
     };
-    *state.deadlines.get_mut(id.0 as usize).expect("looked up above") = updated;
+    state.deadlines.with_mut(id.0 as usize, |d| *d = updated).expect("looked up above");
     abi::reply_success(frame);
     Ok(())
 }
@@ -77,9 +77,14 @@ pub fn invoke(state: &mut KernelState, current: TcbId, cptr: CPtr, frame: &mut T
 /// notification has gone is simply disarmed.
 pub fn fire_expired(state: &mut KernelState, now: u64) {
     while let Some((index, _)) = next_due(state, now) {
-        let deadline = state.deadlines.get_mut(index).expect("found by next_due");
-        deadline.at = None;
-        if let Some((notification, badge)) = deadline.notification {
+        let notification = state
+            .deadlines
+            .with_mut(index, |d| {
+                d.at = None;
+                d.notification
+            })
+            .expect("found by next_due");
+        if let Some((notification, badge)) = notification {
             let _ = signal_notification(state, notification, badge);
         }
     }
@@ -87,14 +92,14 @@ pub fn fire_expired(state: &mut KernelState, now: u64) {
 
 fn next_due(state: &KernelState, now: u64) -> Option<(usize, u64)> {
     (0..MAX_DEADLINES)
-        .filter_map(|i| Some((i, state.deadlines.get(i)?.at?)))
+        .filter_map(|i| Some((i, state.deadlines.with(i, |d| d.at)??)))
         .filter(|&(_, at)| at <= now)
         .min_by_key(|&(_, at)| at)
 }
 
 /// The earliest armed deadline, if any.
 pub fn earliest(state: &KernelState) -> Option<u64> {
-    (0..MAX_DEADLINES).filter_map(|i| state.deadlines.get(i)?.at).min()
+    (0..MAX_DEADLINES).filter_map(|i| state.deadlines.with(i, |d| d.at)?).min()
 }
 
 #[cfg(test)]

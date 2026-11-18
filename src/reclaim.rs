@@ -47,12 +47,14 @@ impl Doomed {
 /// Destroys everything made from `untyped` and its descendants, and empties it. The `Untyped` itself survives, ready to
 /// be retyped from again.
 pub fn reset(state: &mut KernelState, untyped: UntypedId) -> Result<(), SyscallError> {
-    state.untypeds.get(untyped.0 as usize).ok_or(SyscallError::InvalidCapability)?;
+    if !state.untypeds.contains(untyped.0 as usize) {
+        return Err(SyscallError::InvalidCapability);
+    }
     let doomed = mark(state, untyped);
 
     // Never free the tables the hart is running on: switch to the kernel-only root first.
     let active = ACTIVE_ROOT.load(core::sync::atomic::Ordering::Relaxed);
-    let active_doomed = (0..MAX_VSPACES).any(|i| doomed.vspaces[i] && state.vspaces.get(i).is_some_and(|v| v.root == active));
+    let active_doomed = (0..MAX_VSPACES).any(|i| doomed.vspaces[i] && state.vspaces.with(i, |v| v.root == active).unwrap_or(false));
     if active_doomed {
         if let Some(idle) = state.kernel_template.idle_root {
             activate(idle);
@@ -64,19 +66,53 @@ pub fn reset(state: &mut KernelState, untyped: UntypedId) -> Result<(), SyscallE
     }
     // A surviving thread that relied on something going away can't run: suspend it.
     for i in (0..MAX_TCBS).filter(|&i| !doomed.tcbs[i]) {
-        let Some(tcb) = state.tcbs.get(i) else { continue };
+        let Some(tcb) = state.tcbs.with(i, |x| *x) else { continue };
         let lost_cspace = tcb.cspace.is_some_and(|c| doomed.cnodes[c.0 as usize]);
         let lost_sched = tcb.sched_context.is_some_and(|s| doomed.sched_contexts[s.0 as usize]);
         let lost_vspace = tcb.address_space.is_some_and(|root| {
-            (0..MAX_VSPACES).any(|v| doomed.vspaces[v] && state.vspaces.get(v).is_some_and(|vs| vs.root == root))
+            (0..MAX_VSPACES).any(|v| doomed.vspaces[v] && state.vspaces.with(v, |vs| vs.root == root).unwrap_or(false))
         });
         if lost_cspace || lost_sched || lost_vspace {
             unlink(state, TcbId(i as u16));
-            state.tcbs.get_mut(i).expect("present").state = ThreadState::Inactive;
+            // It no longer names what went: a freed pool slot is reused by the next retype (found by RFC-0037's proofs).
+            state
+                .tcbs
+                .with_mut(i, |t| {
+                    t.state = ThreadState::Inactive;
+                    if lost_cspace {
+                        t.cspace = None;
+                    }
+                    if lost_sched {
+                        t.sched_context = None;
+                    }
+                    if lost_vspace {
+                        t.address_space = None;
+                    }
+                })
+                .expect("present");
         }
     }
+    // A capability in flight to something going: the send fails, as if the capability had been refused when sent. Left
+    // in place it would name a freed pool slot that the next retype reuses, and the receiver would get a capability to
+    // that, which nobody granted (found by RFC-0037's proofs). A send on an endpoint that's going fails below anyway.
+    for i in (0..MAX_TCBS).filter(|&i| !doomed.tcbs[i]) {
+        let Some(ThreadState::BlockedSend { endpoint, extra_cap: Some(cap), .. }) = state.tcbs.with(i, |t| t.state) else {
+            continue;
+        };
+        if !doomed.cap(&cap) || doomed.endpoints[endpoint.0 as usize] {
+            continue;
+        }
+        let sender = TcbId(i as u16);
+        state.endpoints.with_mut(endpoint.0 as usize, |e| {
+            if let EndpointQueue::Send(mut q) = e.queue {
+                q.remove(sender);
+                e.queue = if q.is_empty() { EndpointQueue::Empty } else { EndpointQueue::Send(q) };
+            }
+        });
+        fail_blocked(state, sender, SyscallError::InvalidCapability);
+    }
     for i in (0..MAX_ENDPOINTS).filter(|&i| doomed.endpoints[i]) {
-        let Some(endpoint) = state.endpoints.get(i).copied() else { continue };
+        let Some(endpoint) = state.endpoints.with(i, |x| *x) else { continue };
         if let EndpointQueue::Send(mut q) | EndpointQueue::Recv(mut q) = endpoint.queue {
             while let Some(blocked) = q.pop_front() {
                 fail_blocked(state, blocked, SyscallError::InvalidCapability);
@@ -85,55 +121,68 @@ pub fn reset(state: &mut KernelState, untyped: UntypedId) -> Result<(), SyscallE
     }
     for i in (0..MAX_NOTIFICATIONS).filter(|&i| doomed.notifications[i]) {
         let gone = NotificationId(i as u16);
-        let Some(mut waiters) = state.notifications.get(i).map(|n| n.waiters) else { continue };
+        let Some(mut waiters) = state.notifications.with(i, |n| n.waiters) else { continue };
         while let Some(blocked) = waiters.pop_front() {
             fail_blocked(state, blocked, SyscallError::InvalidCapability);
         }
         unbind(state, gone);
     }
     for i in 0..MAX_FRAMES {
-        let Some(frame) = state.frames.get(i).copied() else { continue };
+        let Some(frame) = state.frames.with(i, |x| *x) else { continue };
         for (slot, mapping) in frame.mapped_at.iter().enumerate() {
             let Some((vspace, vaddr)) = *mapping else { continue };
             let vspace_doomed = doomed.vspaces[vspace.0 as usize];
             if doomed.frames[i] && !vspace_doomed {
-                if let Some(v) = state.vspaces.get(vspace.0 as usize) {
+                if let Some(root) = state.vspaces.with(vspace.0 as usize, |v| v.root) {
                     // SAFETY: a live VSpace root from the kernel's pool, and a mapping this Frame recorded.
-                    unsafe { lantern_hal::riscv64_unmap(v.root as *mut lantern_hal::Riscv64PageTable, vaddr) };
+                    unsafe { lantern_hal::riscv64_unmap(root as *mut lantern_hal::Riscv64PageTable, vaddr) };
                 }
             }
             if vspace_doomed && !doomed.frames[i] {
                 // A surviving Frame loses a mapping in a VSpace that's going.
-                state.frames.get_mut(i).expect("present").mapped_at[slot] = None;
+                // Copied, changed and written back whole, as in `crate::frame`: no write at an index the proofs can't
+                // resolve.
+                state
+                    .frames
+                    .with_mut(i, |f| {
+                        let mut mapped_at = f.mapped_at;
+                        mapped_at[slot] = None;
+                        f.mapped_at = mapped_at;
+                    })
+                    .expect("present");
             }
         }
     }
     for i in (0..MAX_VSPACES).filter(|&i| doomed.vspaces[i]) {
-        if let Some(root) = state.vspaces.get(i).map(|v| v.root) {
+        if let Some(root) = state.vspaces.with(i, |v| v.root) {
             crate::vspace::free_tables(state, root);
         }
     }
 
     // Every capability to anything destroyed, in every CNode that survives.
     for c in (0..MAX_CNODES).filter(|&c| !doomed.cnodes[c]) {
-        let Some(cnode) = state.cnodes.get_mut(c) else { continue };
-        for slot in 0..crate::limits::CNODE_SLOTS {
-            let cap = cnode.get(slot).expect("in range");
-            if doomed.cap(&cap) {
-                *cnode.slot_mut(slot).expect("in range") = Capability::Null;
+        state.cnodes.with_mut(c, |cnode| {
+            for slot in 0..crate::limits::CNODE_SLOTS {
+                let cap = cnode.get(slot).expect("in range");
+                if doomed.cap(&cap) {
+                    cnode.set(slot, Capability::Null);
+                }
             }
-        }
+        });
     }
 
     free(state, &doomed);
-    state.untypeds.get_mut(untyped.0 as usize).expect("checked above").rewind();
+    state.untypeds.with_mut(untyped.0 as usize, |u| u.rewind()).expect("checked above");
 
-    // The current thread may be one of the dead; if not, it may have lost a mapping it was using.
-    if state.scheduler.current.is_some_and(|t| doomed.tcbs[t.0 as usize]) {
+    // The current thread may be one of the dead, or suspended above (it lost its own CSpace, scheduling context or
+    // address space: RFC-0037's proofs found it otherwise stayed current, `Inactive`). Either way it doesn't run on.
+    // If not, it may have lost a mapping it was using.
+    let gone = |t: TcbId| doomed.tcbs[t.0 as usize] || state.tcbs.with(t.0 as usize, |t| t.state != ThreadState::Running).unwrap_or(true);
+    if state.scheduler.current.is_some_and(gone) {
         state.scheduler.current = None;
-    } else if let Some(tcb) = state.scheduler.current.and_then(|t| state.tcbs.get(t.0 as usize)) {
+    } else if let Some(t) = state.scheduler.current {
         // Re-activating flushes any stale translation for a page unmapped above.
-        crate::state::activate_if_paged(tcb);
+        state.tcbs.with(t.0 as usize, crate::state::activate_if_paged);
     }
     Ok(())
 }
@@ -145,8 +194,8 @@ fn mark(state: &KernelState, root: UntypedId) -> Doomed {
     loop {
         let mut changed = false;
         for i in 0..MAX_UNTYPEDS {
-            let Some(u) = state.untypeds.get(i) else { continue };
-            if !set[i] && u.origin.is_some_and(|o| set[o.0 as usize]) {
+            let Some(origin) = state.untypeds.with(i, |u| u.origin) else { continue };
+            if !set[i] && origin.is_some_and(|o| set[o.0 as usize]) {
                 set[i] = true;
                 changed = true;
             }
@@ -161,13 +210,13 @@ fn mark(state: &KernelState, root: UntypedId) -> Doomed {
     untypeds[root.0 as usize] = false;
     Doomed {
         untypeds,
-        cnodes: core::array::from_fn(|i| state.cnodes.get(i).is_some() && from(o.cnodes[i])),
-        tcbs: core::array::from_fn(|i| state.tcbs.get(i).is_some() && from(o.tcbs[i])),
-        endpoints: core::array::from_fn(|i| state.endpoints.get(i).is_some() && from(o.endpoints[i])),
-        notifications: core::array::from_fn(|i| state.notifications.get(i).is_some() && from(o.notifications[i])),
-        sched_contexts: core::array::from_fn(|i| state.sched_contexts.get(i).is_some() && from(o.sched_contexts[i])),
-        vspaces: core::array::from_fn(|i| state.vspaces.get(i).is_some() && from(o.vspaces[i])),
-        frames: core::array::from_fn(|i| state.frames.get(i).is_some() && from(o.frames[i])),
+        cnodes: core::array::from_fn(|i| state.cnodes.contains(i) && from(o.cnodes[i])),
+        tcbs: core::array::from_fn(|i| state.tcbs.contains(i) && from(o.tcbs[i])),
+        endpoints: core::array::from_fn(|i| state.endpoints.contains(i) && from(o.endpoints[i])),
+        notifications: core::array::from_fn(|i| state.notifications.contains(i) && from(o.notifications[i])),
+        sched_contexts: core::array::from_fn(|i| state.sched_contexts.contains(i) && from(o.sched_contexts[i])),
+        vspaces: core::array::from_fn(|i| state.vspaces.contains(i) && from(o.vspaces[i])),
+        frames: core::array::from_fn(|i| state.frames.contains(i) && from(o.frames[i])),
     }
 }
 
@@ -175,33 +224,32 @@ fn mark(state: &KernelState, root: UntypedId) -> Doomed {
 fn unlink(state: &mut KernelState, id: TcbId) {
     state.scheduler.remove_ready(id);
     for i in 0..MAX_ENDPOINTS {
-        let Some(endpoint) = state.endpoints.get_mut(i) else { continue };
-        endpoint.queue = match endpoint.queue {
-            EndpointQueue::Send(mut q) => {
-                q.remove(id);
-                if q.is_empty() { EndpointQueue::Empty } else { EndpointQueue::Send(q) }
-            }
-            EndpointQueue::Recv(mut q) => {
-                q.remove(id);
-                if q.is_empty() { EndpointQueue::Empty } else { EndpointQueue::Recv(q) }
-            }
-            EndpointQueue::Empty => EndpointQueue::Empty,
-        };
+        state.endpoints.with_mut(i, |endpoint| {
+            endpoint.queue = match endpoint.queue {
+                EndpointQueue::Send(mut q) => {
+                    q.remove(id);
+                    if q.is_empty() { EndpointQueue::Empty } else { EndpointQueue::Send(q) }
+                }
+                EndpointQueue::Recv(mut q) => {
+                    q.remove(id);
+                    if q.is_empty() { EndpointQueue::Empty } else { EndpointQueue::Recv(q) }
+                }
+                EndpointQueue::Empty => EndpointQueue::Empty,
+            };
+        });
     }
     for i in 0..MAX_NOTIFICATIONS {
-        if let Some(n) = state.notifications.get_mut(i) {
-            n.waiters.remove(id);
-        }
+        state.notifications.with_mut(i, |n| n.waiters.remove(id));
     }
     // Nobody can reply to it any more, and a caller it owed a reply to is told.
     for i in 0..MAX_TCBS {
-        if let Some(t) = state.tcbs.get_mut(i) {
+        state.tcbs.with_mut(i, |t| {
             if t.reply_to == Some(id) {
                 t.reply_to = None;
             }
-        }
+        });
     }
-    let owed = state.tcbs.get_mut(id.0 as usize).and_then(|t| t.reply_to.take());
+    let owed = state.tcbs.with_mut(id.0 as usize, |t| t.reply_to.take()).flatten();
     if let Some(caller) = owed {
         fail_blocked(state, caller, SyscallError::InvalidCapability);
     }
@@ -211,18 +259,18 @@ fn unlink(state: &mut KernelState, id: TcbId) {
 fn unbind(state: &mut KernelState, gone: NotificationId) {
     crate::irq::unbind_notification(state, gone);
     for i in 0..MAX_DEADLINES {
-        if let Some(d) = state.deadlines.get_mut(i) {
+        state.deadlines.with_mut(i, |d| {
             if d.notification.is_some_and(|(n, _)| n == gone) {
                 *d = crate::object::Deadline::default();
             }
-        }
+        });
     }
     for i in 0..MAX_TCBS {
-        if let Some(t) = state.tcbs.get_mut(i) {
+        state.tcbs.with_mut(i, |t| {
             if t.fault_notification.is_some_and(|(n, _)| n == gone) {
                 t.fault_notification = None;
             }
-        }
+        });
     }
 }
 
@@ -330,6 +378,58 @@ mod tests {
     fn reset_cap(state: &mut KernelState, tcb: TcbId, cptr: CPtr) -> Result<(), SyscallError> {
         let Capability::Untyped { id, .. } = cap(state, tcb, cptr) else { panic!("not an Untyped") };
         reset(state, id)
+    }
+
+    /// Found by RFC-0037's proofs: a thread that resets the `Untyped` its own scheduling context came from loses it,
+    /// and is suspended like any other thread that did. It must stop being current too, not run on, `Inactive`.
+    #[test]
+    fn a_thread_that_resets_its_own_scheduling_context_is_no_longer_current() {
+        let ram = Ram::new();
+        let (mut state, launcher) = setup(&ram);
+        state.tcbs.get_mut(launcher.0 as usize).unwrap().state = ThreadState::Running;
+        retype(&mut state, launcher, CHILD_CPTR, SCHED, 10);
+        let Capability::SchedContext { id, .. } = cap(&state, launcher, 10) else { panic!() };
+        state.tcbs.get_mut(launcher.0 as usize).unwrap().sched_context = Some(id);
+        assert_eq!(crate::wf::check(&state), Ok(()));
+
+        reset_cap(&mut state, launcher, CHILD_CPTR).unwrap();
+        assert_eq!(state.tcbs.get(launcher.0 as usize).unwrap().state, ThreadState::Inactive);
+        assert_eq!(state.scheduler.current, None, "a suspended thread isn't current");
+        assert_eq!(state.tcbs.get(launcher.0 as usize).unwrap().sched_context, None, "nor names what went");
+        assert_eq!(crate::wf::check(&state), Ok(()));
+    }
+
+    /// Found by RFC-0037's proofs: a capability in flight, attached to a blocked `Send`, to something `Reset` destroys.
+    /// Left there, it names a freed pool slot that the next retype reuses, and the receiver would get a capability to
+    /// that, which nobody granted. The send fails instead, as if the capability had been refused when it was sent.
+    #[test]
+    fn a_capability_in_flight_to_something_reset_destroys_fails_the_send() {
+        let ram = Ram::new();
+        let (mut state, launcher) = setup(&ram);
+        state.tcbs.get_mut(launcher.0 as usize).unwrap().state = ThreadState::Running;
+        retype(&mut state, launcher, ROOT_CPTR, ENDPOINT, 10); // From the parent: survives.
+        retype(&mut state, launcher, CHILD_CPTR, NOTIFICATION, 11); // From the child: goes.
+        let Capability::Endpoint { id: endpoint, .. } = cap(&state, launcher, 10) else { panic!() };
+        let Capability::Notification { id: notification, .. } = cap(&state, launcher, 11) else { panic!() };
+        let sender = TcbId(state.tcbs.alloc(Tcb::new()).unwrap() as u16);
+        state.tcbs.get_mut(sender.0 as usize).unwrap().state = ThreadState::BlockedSend {
+            endpoint,
+            badge: 0,
+            is_call: false,
+            extra_cap: Some(Capability::Notification { id: notification, badge: 0, rights: Rights::ALL }),
+            reply_dest_slot: None,
+        };
+        let mut queue = crate::queue::ArrayQueue::new();
+        queue.push_back(sender);
+        state.endpoints.get_mut(endpoint.0 as usize).unwrap().queue = EndpointQueue::Send(queue);
+        assert_eq!(crate::wf::check(&state), Ok(()));
+
+        reset_cap(&mut state, launcher, CHILD_CPTR).unwrap();
+        assert_eq!(crate::wf::check(&state), Ok(()), "nothing names what went");
+        let sender_tcb = state.tcbs.get(sender.0 as usize).unwrap();
+        assert_eq!(sender_tcb.state, ThreadState::Ready, "the send failed, and the sender runs again");
+        assert!(sender_tcb.context.tag().is_error());
+        assert!(matches!(state.endpoints.get(endpoint.0 as usize).unwrap().queue, EndpointQueue::Empty));
     }
 
     const ENDPOINT: usize = 2;

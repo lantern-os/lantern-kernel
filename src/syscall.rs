@@ -131,6 +131,7 @@ pub fn dispatch(state: &mut KernelState, frame: &mut TrapFrame) {
     if let Err(e) = result {
         abi::reply_error(frame, e);
     }
+    crate::wf::debug_check(state);
 }
 
 #[cfg(test)]
@@ -305,7 +306,8 @@ mod tests {
         let cnode = CNodeId(state.cnodes.alloc(CNode::empty()).unwrap() as u16);
         let tcb = TcbId(state.tcbs.alloc(Tcb::new()).unwrap() as u16);
         state.tcbs.get_mut(tcb.0 as usize).unwrap().cspace = Some(cnode);
-        state.make_ready(tcb);
+        // Current, as the kernel makes a thread current: `Running`, and in no queue (W, `crate::wf`).
+        state.tcbs.get_mut(tcb.0 as usize).unwrap().state = crate::object::ThreadState::Running;
         state.scheduler.current = Some(tcb);
 
         let mut frame = TrapFrame::zeroed();

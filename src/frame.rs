@@ -80,7 +80,7 @@ pub fn invoke(
         LABEL_MAP => map(state, current, frame_id, frame)?,
         LABEL_UNMAP => unmap(state, current, frame_id, frame)?,
         LABEL_ADDRESS => {
-            let f = state.frames.get(frame_id.0 as usize).ok_or(SyscallError::InvalidCapability)?;
+            let f = state.frames.with(frame_id.0 as usize, |f| *f).ok_or(SyscallError::InvalidCapability)?;
             if !f.dma {
                 return Err(SyscallError::IllegalOperation);
             }
@@ -109,7 +109,7 @@ fn map(
     let vaddr = frame.mr(2);
     let perms = PermFlags(frame.mr(3));
 
-    let f = state.frames.get(frame_id.0 as usize).ok_or(SyscallError::InvalidCapability)?;
+    let f = state.frames.with(frame_id.0 as usize, |f| *f).ok_or(SyscallError::InvalidCapability)?;
     // A free slot in `mapped_at` — `IllegalOperation` once every slot this
     // Frame has (`MAX_FRAME_MAPPINGS`) is already in use. Phase 1 rejected any
     // second mapping outright; Phase 3 (ADR-0022 Part 2) allows up to two, for
@@ -120,8 +120,8 @@ fn map(
         return Err(SyscallError::AlignmentError);
     }
 
-    let vspace = state.vspaces.get(vspace_id.0 as usize).ok_or(SyscallError::InvalidCapability)?;
-    let root = vspace.root as *mut lantern_hal::Riscv64PageTable;
+    let root = state.vspaces.with(vspace_id.0 as usize, |v| v.root).ok_or(SyscallError::InvalidCapability)?
+        as *mut lantern_hal::Riscv64PageTable;
 
     // SAFETY: `root` is a valid Sv39 root page table — every VSpace was built by
     // `admin::untyped_retype`'s `ObjectType::VSpace` arm, which always produces
@@ -174,8 +174,16 @@ fn map(
     state.kernel_page_tables.release_last(max_new_tables - next_spare);
 
     crate::state::flush_if_active(root as usize);
-    let f = state.frames.get_mut(frame_id.0 as usize).expect("checked above");
-    f.mapped_at[free_slot] = Some((vspace_id, vaddr));
+    // Copied, changed and written back whole: indexing the kernel state's own array by `free_slot` would put the write at
+    // an offset the Kani proofs can't resolve (RFC-0037).
+    state
+        .frames
+        .with_mut(frame_id.0 as usize, |f| {
+            let mut mapped_at = f.mapped_at;
+            mapped_at[free_slot] = Some((vspace_id, vaddr));
+            f.mapped_at = mapped_at;
+        })
+        .expect("checked above");
     Ok(())
 }
 
@@ -190,22 +198,28 @@ fn unmap(state: &mut KernelState, current: TcbId, frame_id: FrameId, frame: &Tra
         _ => return Err(SyscallError::InvalidCapability),
     };
 
-    let f = state.frames.get(frame_id.0 as usize).ok_or(SyscallError::InvalidCapability)?;
+    let f = state.frames.with(frame_id.0 as usize, |f| *f).ok_or(SyscallError::InvalidCapability)?;
     let Some(slot) = f.mapped_at.iter().position(|m| matches!(m, Some((v, _)) if *v == vspace_id)) else {
         return Ok(()); // Not currently mapped into this VSpace — a harmless no-op.
     };
     let vaddr = f.mapped_at[slot].expect("position() just found a Some entry").1;
 
-    let vspace = state.vspaces.get(vspace_id.0 as usize).ok_or(SyscallError::InvalidCapability)?;
-    let root = vspace.root as *mut lantern_hal::Riscv64PageTable;
+    let root = state.vspaces.with(vspace_id.0 as usize, |v| v.root).ok_or(SyscallError::InvalidCapability)?
+        as *mut lantern_hal::Riscv64PageTable;
     // SAFETY: as `map`'s — `root` is a valid Sv39 root page table.
     unsafe { lantern_hal::riscv64_unmap(root, vaddr) };
     // Before returning to a program that may be running on this table: until the flush, the hart can still reach the
     // page through a cached translation.
     crate::state::flush_if_active(root as usize);
 
-    let f = state.frames.get_mut(frame_id.0 as usize).expect("checked above");
-    f.mapped_at[slot] = None;
+    state
+        .frames
+        .with_mut(frame_id.0 as usize, |f| {
+            let mut mapped_at = f.mapped_at;
+            mapped_at[slot] = None;
+            f.mapped_at = mapped_at;
+        })
+        .expect("checked above");
     Ok(())
 }
 

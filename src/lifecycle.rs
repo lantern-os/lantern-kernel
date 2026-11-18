@@ -33,12 +33,18 @@ pub fn invoke(state: &mut KernelState, current: TcbId, cptr: CPtr, frame: &mut T
     }
     match label {
         LABEL_SET_ENTRY => {
-            let tcb = state.tcbs.get_mut(id.0 as usize).ok_or(SyscallError::InvalidCapability)?;
-            // Only before it first runs: a running thread's registers are its own.
-            if tcb.state != ThreadState::Inactive || tcb.fault.is_some() {
-                return Err(SyscallError::IllegalOperation);
-            }
-            tcb.context = SavedContext::initial(frame.mr(1), frame.mr(2), frame.mr(3));
+            let (pc, sp, arg0) = (frame.mr(1), frame.mr(2), frame.mr(3));
+            state
+                .tcbs
+                .with_mut(id.0 as usize, |tcb| {
+                    // Only before it first runs: a running thread's registers are its own.
+                    if tcb.state != ThreadState::Inactive || tcb.fault.is_some() {
+                        return Err(SyscallError::IllegalOperation);
+                    }
+                    tcb.context = SavedContext::initial(pc, sp, arg0);
+                    Ok(())
+                })
+                .ok_or(SyscallError::InvalidCapability)??;
         }
         LABEL_SET_FAULT_NOTIFICATION => {
             let (notification, badge) = match state.lookup_cap(current, frame.mr(1))? {
@@ -49,11 +55,14 @@ pub fn invoke(state: &mut KernelState, current: TcbId, cptr: CPtr, frame: &mut T
             if badge == 0 {
                 return Err(SyscallError::InvalidArgument);
             }
-            state.tcbs.get_mut(id.0 as usize).ok_or(SyscallError::InvalidCapability)?.fault_notification =
-                Some((notification, badge));
+            state
+                .tcbs
+                .with_mut(id.0 as usize, |tcb| tcb.fault_notification = Some((notification, badge)))
+                .ok_or(SyscallError::InvalidCapability)?;
         }
         LABEL_READ_FAULT => {
-            let (cause, value) = state.tcbs.get(id.0 as usize).ok_or(SyscallError::InvalidCapability)?.fault.unwrap_or((0, 0));
+            let (cause, value) =
+                state.tcbs.with(id.0 as usize, |tcb| tcb.fault).ok_or(SyscallError::InvalidCapability)?.unwrap_or((0, 0));
             frame.set_mr(1, cause);
             frame.set_mr(2, value);
         }
@@ -67,11 +76,13 @@ pub fn invoke(state: &mut KernelState, current: TcbId, cptr: CPtr, frame: &mut T
 /// the trap glue idles.
 pub fn fault(state: &mut KernelState, frame: &mut TrapFrame, cause: usize, value: usize) {
     let Some(current) = state.scheduler.current else { return };
-    let Some(tcb) = state.tcbs.get_mut(current.0 as usize) else { return };
-    tcb.state = ThreadState::Inactive;
-    tcb.fault = Some((cause, value));
-    let notify = tcb.fault_notification;
-    let owed = tcb.reply_to.take();
+    let Some((notify, owed)) = state.tcbs.with_mut(current.0 as usize, |tcb| {
+        tcb.state = ThreadState::Inactive;
+        tcb.fault = Some((cause, value));
+        (tcb.fault_notification, tcb.reply_to.take())
+    }) else {
+        return;
+    };
     if let Some(caller) = owed {
         fail_blocked(state, caller, SyscallError::InvalidCapability);
     }
@@ -83,15 +94,19 @@ pub fn fault(state: &mut KernelState, frame: &mut TrapFrame, cause: usize, value
 
 /// Resumes a thread that was blocked on something that has gone, with `error` as its system call's result.
 pub fn fail_blocked(state: &mut KernelState, id: TcbId, error: SyscallError) {
-    let Some(tcb) = state.tcbs.get_mut(id.0 as usize) else { return };
-    if matches!(tcb.state, ThreadState::Inactive | ThreadState::Ready | ThreadState::Running) {
-        return;
+    let failed = state.tcbs.with_mut(id.0 as usize, |tcb| {
+        if matches!(tcb.state, ThreadState::Inactive | ThreadState::Ready | ThreadState::Running) {
+            return false;
+        }
+        tcb.context.set_mr(0, error.code());
+        let tag = tcb.context.tag();
+        tcb.context.set_tag(MessageTag { flags: tag.flags | FLAG_ERROR, ..tag });
+        tcb.state = ThreadState::Inactive;
+        true
+    });
+    if failed == Some(true) {
+        state.make_ready(id);
     }
-    tcb.context.set_mr(0, error.code());
-    let tag = tcb.context.tag();
-    tcb.context.set_tag(MessageTag { flags: tag.flags | FLAG_ERROR, ..tag });
-    tcb.state = ThreadState::Inactive;
-    state.make_ready(id);
 }
 
 #[cfg(test)]

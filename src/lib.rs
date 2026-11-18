@@ -62,6 +62,9 @@ pub mod scheduler;
 pub mod state;
 pub mod syscall;
 pub mod vspace;
+pub mod wf;
+#[cfg(kani)]
+mod proofs;
 
 pub use error::SyscallError;
 pub use syscall::{dispatch, SyscallNumber};
@@ -126,6 +129,8 @@ pub fn handle_trap<H: lantern_hal::Hal>(state: &mut state::KernelState, frame: &
     if state.timer_armed > target {
         arm_timer::<H>(state, target);
     }
+    // RFC-0037: in debug builds, every trap leaves W true, whatever caused it.
+    wf::debug_check(state);
 }
 
 fn claim_pending<H: lantern_hal::Hal>(state: &mut state::KernelState) {
@@ -216,11 +221,11 @@ pub unsafe fn enter_first_thread(id: cap::TcbId) -> ! {
     state.timer_owner = Some(id);
     arm_timer::<lantern_hal::Hardware>(state, state.slice_end);
     let mut frame = lantern_hal::TrapFrame::zeroed();
-    if let Some(tcb) = state.tcbs.get_mut(id.0 as usize) {
+    state.tcbs.with_mut(id.0 as usize, |tcb| {
         tcb.state = object::ThreadState::Running;
         tcb.context.restore_into(&mut frame);
         state::activate_if_paged(tcb);
-    }
+    });
     // SAFETY: `frame` was just populated from `id`'s own saved context; the rest
     // of this function's contract is this function's own, forwarded from the
     // caller.
@@ -333,6 +338,9 @@ mod tests {
 
     /// `tcb` is running, in a slice ending at `slice_end`, with the timer armed for it.
     fn running(state: &mut state::KernelState, tcb: TcbId, slice_end: u64) {
+        // As the kernel itself makes a thread current: `Running`, and in no queue (W, `crate::wf`).
+        state.scheduler.remove_ready(tcb);
+        state.tcbs.get_mut(tcb.0 as usize).unwrap().state = object::ThreadState::Running;
         state.scheduler.current = Some(tcb);
         state.timer_owner = Some(tcb);
         state.slice_end = slice_end;
@@ -430,6 +438,8 @@ mod tests {
         handle_trap::<FakeHal>(&mut state, &mut frame);
         assert_eq!((state.scheduler.current, calls()), (Some(b), vec![format!("arm {}", 500 + Q)]));
         assert_eq!(state.scheduler.ready.pop_front(), Some(a));
+        // Out of the way, as a suspended thread is (W, `crate::wf`: a `Ready` thread is in the ready queue).
+        state.tcbs.get_mut(a.0 as usize).unwrap().state = ThreadState::Inactive;
 
         // Alone at the end of its slice: it keeps running, with a fresh one.
         fake(|f| f.now = 500 + Q);

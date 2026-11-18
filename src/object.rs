@@ -15,7 +15,7 @@ const RAW_WORDS: usize = lantern_hal::RAW_WORDS;
 /// copied out of it. Needed because a blocked/ready thread's registers must live
 /// somewhere while a *different* thread's [`TrapFrame`] occupies the one hardware
 /// trap frame (Phase 1 is single-hart, single-stack — [ADR-0010](../../lantern-rfcs/adr/0010-kernel-concurrency-model.md)).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SavedContext {
     syscall_num: usize,
     tag: MessageTag,
@@ -72,6 +72,20 @@ impl SavedContext {
 
     pub fn mr(&self, index: usize) -> usize {
         self.mrs[index]
+    }
+
+    /// Whether every register is the same: `==`, word by word. For the Kani proofs (RFC-0037), where the derived
+    /// comparison becomes a byte-wise `memcmp` whose loop outruns their unwinding bound.
+    #[cfg(kani)]
+    pub fn same_as(&self, other: &Self) -> bool {
+        let mut same = self.syscall_num == other.syscall_num && self.tag == other.tag;
+        for i in 0..MR_COUNT {
+            same &= self.mrs[i] == other.mrs[i];
+        }
+        for i in 0..RAW_WORDS {
+            same &= self.raw[i] == other.raw[i];
+        }
+        same
     }
 
     pub fn set_mr(&mut self, index: usize, value: usize) {
@@ -318,7 +332,9 @@ impl Untyped {
     /// already uses.
     pub fn bump(&mut self, size: usize, align: usize) -> Option<usize> {
         let (next, end) = self.memory?;
-        let aligned = (next + align - 1) & !(align - 1);
+        // Checked: a range ending near the top of the address space would otherwise overflow while rounding up, and
+        // the kernel would panic (found by RFC-0037's proofs).
+        let aligned = next.checked_add(align - 1)? & !(align - 1);
         let new_next = aligned.checked_add(size)?;
         if new_next > end {
             return None;
@@ -397,6 +413,7 @@ pub struct VSpace {
 /// plus at most a couple of branch tables), not tuned, same philosophy as
 /// every other fixed-capacity pool in `crate::limits`.
 #[repr(C, align(4096))]
+#[cfg_attr(kani, derive(Clone))]
 pub struct KernelPageTables {
     bytes: [u8; crate::limits::MAX_KERNEL_PAGE_TABLES * lantern_hal::RISCV64_PAGE_SIZE],
     next: usize,
@@ -551,6 +568,13 @@ pub struct Deadline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bump_near_the_top_of_the_address_space_refuses_rather_than_overflowing() {
+        let top = usize::MAX - 4096;
+        let mut u = Untyped::with_memory(1, top, 4096);
+        assert_eq!(u.bump(4096, 2 * 1024 * 1024), None);
+    }
 
     #[test]
     fn saved_context_roundtrips_through_a_trap_frame() {

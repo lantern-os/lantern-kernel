@@ -32,16 +32,42 @@
 //! 95 Frames, 58 page tables and 228 root slots, with 11 endpoints. The pools were raised to 24/24/16/24/24/24/24, 176
 //! Frames, 128 page tables, 256 slots and 8 interrupt handlers.
 
+// RFC-0037: under `cfg(kani)` only, every pool is small, so the proofs can cover every state of it. The kernel's code is
+// the same at both sizes: it loops over its pools and never special-cases a size.
+#[cfg(not(kani))]
 pub const MAX_CNODES: usize = 24;
+#[cfg(kani)]
+pub const MAX_CNODES: usize = 3;
+#[cfg(not(kani))]
 pub const MAX_TCBS: usize = 24;
+#[cfg(kani)]
+pub const MAX_TCBS: usize = 3;
+#[cfg(not(kani))]
 pub const MAX_ENDPOINTS: usize = 16;
+#[cfg(kani)]
+pub const MAX_ENDPOINTS: usize = 2;
+#[cfg(not(kani))]
 pub const MAX_NOTIFICATIONS: usize = 24;
+#[cfg(kani)]
+pub const MAX_NOTIFICATIONS: usize = 2;
+#[cfg(not(kani))]
 pub const MAX_UNTYPEDS: usize = 24;
+#[cfg(kani)]
+pub const MAX_UNTYPEDS: usize = 2;
+#[cfg(not(kani))]
 pub const MAX_SCHED_CONTEXTS: usize = 24;
+#[cfg(kani)]
+pub const MAX_SCHED_CONTEXTS: usize = 2;
+#[cfg(not(kani))]
 pub const MAX_VSPACES: usize = 24;
+#[cfg(kani)]
+pub const MAX_VSPACES: usize = 2;
 /// System-wide, at megapage granularity (`lantern-boot/STATUS.md`): dozens of 2 MiB
 /// Frames, not hundreds. See the module doc for how this was sized.
+#[cfg(not(kani))]
 pub const MAX_FRAMES: usize = 176;
+#[cfg(kani)]
+pub const MAX_FRAMES: usize = 2;
 /// Kernel-owned page tables (`crate::object::KernelPageTables`) — `VSpace`
 /// roots (bounded by [`MAX_VSPACES`]) plus the L1/L0 branch pages
 /// `FrameInvoke::Map` creates on demand, one 4 KiB page each. Generous for a
@@ -50,19 +76,34 @@ pub const MAX_FRAMES: usize = 176;
 /// `KernelState` (kernel `.bss`) — keep it well clear of the 2 MiB the
 /// kernel image's own linker script (`lantern-boot/linker.ld`) asserts the
 /// whole image must fit within.
+#[cfg(not(kani))]
 pub const MAX_KERNEL_PAGE_TABLES: usize = 128;
+#[cfg(kani)]
+pub const MAX_KERNEL_PAGE_TABLES: usize = 0;
 
 /// Capacity of a single (flat, single-level) CNode, per RFC-0005's CSpace simplification.
 /// Every CNode pays for this, though only the launcher's root needs this many.
+#[cfg(not(kani))]
 pub const CNODE_SLOTS: usize = 256;
+#[cfg(kani)]
+pub const CNODE_SLOTS: usize = 4;
 /// Interrupt lines bound to a driver at once ([RFC-0027](../../lantern-rfcs/rfcs/0027-interrupt-delivery-timer-and-idle.md)).
 /// The console needs one; storage and network will each need one more.
+#[cfg(not(kani))]
 pub const MAX_IRQ_HANDLERS: usize = 8;
+#[cfg(kani)]
+pub const MAX_IRQ_HANDLERS: usize = 1;
 /// Controller actions waiting for the trap glue to apply them, between two traps. Each `IrqHandlerInvoke` queues at
 /// most two, and each delivery two.
+#[cfg(not(kani))]
 pub const MAX_IRQ_ACTIONS: usize = 16;
+#[cfg(kani)]
+pub const MAX_IRQ_ACTIONS: usize = 4;
 /// Every thread's time slice: ADR-0009's `budget == period`, replenished each period (RFC-0027).
 pub const QUANTUM_NS: u64 = 10_000_000;
 /// Armed-or-not `Deadline`s at once ([RFC-0028](../../lantern-rfcs/rfcs/0028-deadlines-and-a-capability-clock.md)).
 /// Finding the earliest is a scan of these, on every trap.
+#[cfg(not(kani))]
 pub const MAX_DEADLINES: usize = 8;
+#[cfg(kani)]
+pub const MAX_DEADLINES: usize = 1;

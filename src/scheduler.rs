@@ -9,6 +9,7 @@ use crate::cap::TcbId;
 use crate::limits::MAX_TCBS;
 use crate::queue::ArrayQueue;
 
+#[cfg_attr(kani, derive(Clone))]
 pub struct Scheduler {
     pub(crate) ready: ArrayQueue<TcbId, MAX_TCBS>,
     pub current: Option<TcbId>,

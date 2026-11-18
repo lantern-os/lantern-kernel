@@ -75,14 +75,18 @@ fn payload_words(frame: &TrapFrame, mr1_spent: bool) -> (usize, usize, usize) {
 /// empty. The one place a transferred capability actually lands — RFC-0010's
 /// kernel-mediated `grant`.
 fn place_transferred_cap(state: &mut KernelState, receiver: TcbId, dest: CPtr, cap: Capability) -> Result<(), SyscallError> {
-    let cspace_id = state.tcbs.get(receiver.0 as usize).ok_or(SyscallError::FailedLookup)?.cspace.ok_or(SyscallError::FailedLookup)?;
-    let cnode = state.cnodes.get_mut(cspace_id.0 as usize).ok_or(SyscallError::FailedLookup)?;
-    let slot = cnode.slot_mut(dest).ok_or(SyscallError::RangeError)?;
-    if *slot != Capability::Null {
-        return Err(SyscallError::IllegalOperation);
-    }
-    *slot = cap;
-    Ok(())
+    let cspace_id = state.tcbs.with(receiver.0 as usize, |t| t.cspace).flatten().ok_or(SyscallError::FailedLookup)?;
+    state
+        .cnodes
+        .with_mut(cspace_id.0 as usize, |c| match c.get(dest) {
+            None => Err(SyscallError::RangeError),
+            Some(Capability::Null) => {
+                c.set(dest, cap);
+                Ok(())
+            }
+            Some(_) => Err(SyscallError::IllegalOperation),
+        })
+        .ok_or(SyscallError::FailedLookup)?
 }
 
 /// The destination CPtr a blocked receiver registered at its own `Recv` time
@@ -90,7 +94,7 @@ fn place_transferred_cap(state: &mut KernelState, receiver: TcbId, dest: CPtr, c
 /// blocked in `Recv` at all (a kernel-internal inconsistency callers should
 /// already have ruled out) or registered no slot.
 fn blocked_receiver_dest_slot(state: &KernelState, receiver: TcbId) -> Option<CPtr> {
-    match state.tcbs.get(receiver.0 as usize)?.state {
+    match state.tcbs.with(receiver.0 as usize, |t| t.state)? {
         ThreadState::BlockedRecv { dest_slot, .. } => dest_slot,
         _ => None,
     }
@@ -100,16 +104,16 @@ fn blocked_receiver_dest_slot(state: &KernelState, receiver: TcbId) -> Option<CP
 /// `Reply` (`ThreadState::BlockedReply`'s `dest_slot`) — the `Call`-side
 /// counterpart of [`blocked_receiver_dest_slot`].
 fn blocked_caller_reply_dest_slot(state: &KernelState, caller: TcbId) -> Option<CPtr> {
-    match state.tcbs.get(caller.0 as usize)?.state {
+    match state.tcbs.with(caller.0 as usize, |t| t.state)? {
         ThreadState::BlockedReply { dest_slot } => dest_slot,
         _ => None,
     }
 }
 
 fn set_endpoint_queue(state: &mut KernelState, id: EndpointId, queue: EndpointQueue) {
-    if let Some(ep) = state.endpoints.get_mut(id.0 as usize) {
+    state.endpoints.with_mut(id.0 as usize, |ep| {
         ep.queue = queue;
-    }
+    });
 }
 
 /// Collapses a drained queue back to `Empty` so future callers see a uniform
@@ -131,13 +135,13 @@ fn deliver_payload(
     mr3: usize,
     tag: MessageTag,
 ) {
-    if let Some(tcb) = state.tcbs.get_mut(target.0 as usize) {
+    state.tcbs.with_mut(target.0 as usize, |tcb| {
         tcb.context.set_mr(0, badge as usize);
         tcb.context.set_mr(1, mr1);
         tcb.context.set_mr(2, mr2);
         tcb.context.set_mr(3, mr3);
         tcb.context.set_tag(tag);
-    }
+    });
 }
 
 fn resolve_endpoint(
@@ -169,7 +173,7 @@ pub fn send(
     let extra_cap = extract_extra_cap(state, current, frame, tag)?;
     let (mr1, mr2, mr3) = payload_words(frame, extra_cap.is_some());
 
-    let endpoint = *state.endpoints.get(id.0 as usize).ok_or(SyscallError::InvalidCapability)?;
+    let endpoint = state.endpoints.with(id.0 as usize, |x| *x).ok_or(SyscallError::InvalidCapability)?;
 
     if let EndpointQueue::Recv(waiters) = endpoint.queue {
         let receiver = waiters.front().expect("Recv variant implies a waiter");
@@ -204,9 +208,9 @@ pub fn send(
         return Err(SyscallError::NotEnoughMemory);
     }
     set_endpoint_queue(state, id, EndpointQueue::Send(send_queue));
-    if let Some(tcb) = state.tcbs.get_mut(current.0 as usize) {
+    state.tcbs.with_mut(current.0 as usize, |tcb| {
         tcb.state = ThreadState::BlockedSend { endpoint: id, badge, is_call: false, extra_cap, reply_dest_slot: None };
-    }
+    });
     // With nothing else ready this leaves no current thread, and the trap glue idles (RFC-0027).
     state.block_current(frame);
     Ok(())
@@ -227,11 +231,11 @@ pub fn recv(
     // `extra_caps` bit, so a plain `Recv` (extra_caps == 0) never treats mr1 as
     // anything but ordinary (ignored) register content.
     let dest_slot = (recv_tag.extra_caps == 1).then(|| frame.mr(1));
-    let endpoint = *state.endpoints.get(id.0 as usize).ok_or(SyscallError::InvalidCapability)?;
+    let endpoint = state.endpoints.with(id.0 as usize, |x| *x).ok_or(SyscallError::InvalidCapability)?;
 
     if let EndpointQueue::Send(waiters) = endpoint.queue {
         let sender = waiters.front().expect("Send variant implies a waiter");
-        let sender_tcb = *state.tcbs.get(sender.0 as usize).ok_or(SyscallError::FailedLookup)?;
+        let sender_tcb = state.tcbs.with(sender.0 as usize, |x| *x).ok_or(SyscallError::FailedLookup)?;
         let ThreadState::BlockedSend { badge: sender_badge, is_call, extra_cap, reply_dest_slot, .. } =
             sender_tcb.state
         else {
@@ -259,12 +263,12 @@ pub fn recv(
         abi::reply_success(frame);
 
         if is_call {
-            if let Some(tcb) = state.tcbs.get_mut(current.0 as usize) {
+            state.tcbs.with_mut(current.0 as usize, |tcb| {
                 tcb.reply_to = Some(sender);
-            }
-            if let Some(tcb) = state.tcbs.get_mut(sender.0 as usize) {
+            });
+            state.tcbs.with_mut(sender.0 as usize, |tcb| {
                 tcb.state = ThreadState::BlockedReply { dest_slot: reply_dest_slot };
-            }
+            });
         } else {
             state.make_ready(sender);
         }
@@ -280,9 +284,9 @@ pub fn recv(
         return Err(SyscallError::NotEnoughMemory);
     }
     set_endpoint_queue(state, id, EndpointQueue::Recv(recv_queue));
-    if let Some(tcb) = state.tcbs.get_mut(current.0 as usize) {
+    state.tcbs.with_mut(current.0 as usize, |tcb| {
         tcb.state = ThreadState::BlockedRecv { endpoint: id, dest_slot };
-    }
+    });
     // With nothing else ready this leaves no current thread, and the trap glue idles (RFC-0027).
     state.block_current(frame);
     Ok(())
@@ -310,7 +314,7 @@ pub fn call(
     // the latter leak through as ordinary payload content.
     let (mr1, mr2, mr3) = payload_words(frame, extra_cap.is_some() || reply_dest_slot.is_some());
 
-    let endpoint = *state.endpoints.get(id.0 as usize).ok_or(SyscallError::InvalidCapability)?;
+    let endpoint = state.endpoints.with(id.0 as usize, |x| *x).ok_or(SyscallError::InvalidCapability)?;
 
     if let EndpointQueue::Recv(waiters) = endpoint.queue {
         let receiver = waiters.front().expect("Recv variant implies a waiter");
@@ -322,12 +326,12 @@ pub fn call(
         let receiver = waiters.pop_front().expect("front() just confirmed a waiter");
         set_endpoint_queue(state, id, normalize(EndpointQueue::Recv(waiters)));
         deliver_payload(state, receiver, badge, mr1, mr2, mr3, tag);
-        if let Some(tcb) = state.tcbs.get_mut(receiver.0 as usize) {
+        state.tcbs.with_mut(receiver.0 as usize, |tcb| {
             tcb.reply_to = Some(current);
-        }
-        if let Some(tcb) = state.tcbs.get_mut(current.0 as usize) {
+        });
+        state.tcbs.with_mut(current.0 as usize, |tcb| {
             tcb.state = ThreadState::BlockedReply { dest_slot: reply_dest_slot };
-        }
+        });
         state.switch_to(frame, receiver);
         return Ok(());
     }
@@ -341,9 +345,9 @@ pub fn call(
         return Err(SyscallError::NotEnoughMemory);
     }
     set_endpoint_queue(state, id, EndpointQueue::Send(send_queue));
-    if let Some(tcb) = state.tcbs.get_mut(current.0 as usize) {
+    state.tcbs.with_mut(current.0 as usize, |tcb| {
         tcb.state = ThreadState::BlockedSend { endpoint: id, badge, is_call: true, extra_cap, reply_dest_slot };
-    }
+    });
     // With nothing else ready this leaves no current thread, and the trap glue idles (RFC-0027).
     state.block_current(frame);
     Ok(())
@@ -368,9 +372,8 @@ pub fn reply(state: &mut KernelState, current: TcbId, frame: &mut TrapFrame) -> 
 
     let target = state
         .tcbs
-        .get(current.0 as usize)
-        .ok_or(SyscallError::IllegalOperation)?
-        .reply_to
+        .with(current.0 as usize, |t| t.reply_to)
+        .flatten()
         .ok_or(SyscallError::IllegalOperation)?;
 
     // Validate and place *before* consuming the reply_to link below, so a
@@ -385,18 +388,18 @@ pub fn reply(state: &mut KernelState, current: TcbId, frame: &mut TrapFrame) -> 
 
     // Nothing below this point can fail, so it's safe to actually consume the
     // reply_to link now.
-    state.tcbs.get_mut(current.0 as usize).expect("looked up above").reply_to = None;
+    state.tcbs.with_mut(current.0 as usize, |t| t.reply_to = None).expect("looked up above");
 
-    match state.tcbs.get_mut(target.0 as usize) {
-        Some(tcb) => {
+    state
+        .tcbs
+        .with_mut(target.0 as usize, |tcb| {
             tcb.context.set_mr(0, 0);
             tcb.context.set_mr(1, mr1);
             tcb.context.set_mr(2, mr2);
             tcb.context.set_mr(3, mr3);
             tcb.context.set_tag(tag);
-        }
-        None => return Err(SyscallError::IllegalOperation),
-    }
+        })
+        .ok_or(SyscallError::IllegalOperation)?;
 
     state.make_ready(current);
     state.switch_to(frame, target);
@@ -433,20 +436,20 @@ pub fn signal(
 /// ORs `badge` into a notification, waking its first waiter if one is blocked in `Wait`. `Signal`'s body, and how
 /// the kernel delivers an interrupt ([`crate::irq::deliver`]).
 pub(crate) fn signal_notification(state: &mut KernelState, id: NotificationId, badge: u64) -> Result<(), SyscallError> {
-    let notif = *state.notifications.get(id.0 as usize).ok_or(SyscallError::InvalidCapability)?;
+    let notif = state.notifications.with(id.0 as usize, |x| *x).ok_or(SyscallError::InvalidCapability)?;
     let mut waiters = notif.waiters;
     if let Some(waiter) = waiters.pop_front() {
         let delivered = notif.signals | badge;
-        if let Some(n) = state.notifications.get_mut(id.0 as usize) {
+        state.notifications.with_mut(id.0 as usize, |n| {
             n.waiters = waiters;
             n.signals = 0;
-        }
-        if let Some(tcb) = state.tcbs.get_mut(waiter.0 as usize) {
+        });
+        state.tcbs.with_mut(waiter.0 as usize, |tcb| {
             tcb.context.set_mr(0, delivered as usize);
-        }
+        });
         state.make_ready(waiter);
-    } else if let Some(n) = state.notifications.get_mut(id.0 as usize) {
-        n.signals |= badge;
+    } else {
+        state.notifications.with_mut(id.0 as usize, |n| n.signals |= badge);
     }
     Ok(())
 }
@@ -458,13 +461,13 @@ pub fn wait(
     frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
     let (id, _badge) = resolve_notification(state, current, cptr, Rights::READ)?;
-    let notif = *state.notifications.get(id.0 as usize).ok_or(SyscallError::InvalidCapability)?;
+    let notif = state.notifications.with(id.0 as usize, |x| *x).ok_or(SyscallError::InvalidCapability)?;
 
     if notif.signals != 0 {
         frame.set_mr(0, notif.signals as usize);
-        if let Some(n) = state.notifications.get_mut(id.0 as usize) {
+        state.notifications.with_mut(id.0 as usize, |n| {
             n.signals = 0;
-        }
+        });
         abi::reply_success(frame);
         return Ok(());
     }
@@ -473,12 +476,12 @@ pub fn wait(
     if !waiters.push_back(current) {
         return Err(SyscallError::NotEnoughMemory);
     }
-    if let Some(n) = state.notifications.get_mut(id.0 as usize) {
+    state.notifications.with_mut(id.0 as usize, |n| {
         n.waiters = waiters;
-    }
-    if let Some(tcb) = state.tcbs.get_mut(current.0 as usize) {
+    });
+    state.tcbs.with_mut(current.0 as usize, |tcb| {
         tcb.state = ThreadState::BlockedWait(id);
-    }
+    });
     // With nothing else ready this leaves no current thread, and the trap glue idles (RFC-0027).
     state.block_current(frame);
     Ok(())
@@ -494,12 +497,12 @@ pub fn poll(
     frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
     let (id, _badge) = resolve_notification(state, current, cptr, Rights::READ)?;
-    let notif = *state.notifications.get(id.0 as usize).ok_or(SyscallError::InvalidCapability)?;
+    let notif = state.notifications.with(id.0 as usize, |x| *x).ok_or(SyscallError::InvalidCapability)?;
 
     if notif.signals != 0 {
-        if let Some(n) = state.notifications.get_mut(id.0 as usize) {
+        state.notifications.with_mut(id.0 as usize, |n| {
             n.signals = 0;
-        }
+        });
     }
     frame.set_mr(0, notif.signals as usize);
     abi::reply_success(frame);
