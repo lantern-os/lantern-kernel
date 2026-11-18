@@ -5,6 +5,15 @@
 **Roadmap:** Phase 3 closed and Phase 4 (hardware and assurance) opened, 2026-11-16, per [RFC-0036](../lantern-rfcs/rfcs/0036-phase-3-to-phase-4-transition.md)/[ADR-0041](../lantern-rfcs/adr/0041-phase-3-complete-phase-4-opened.md).
 
 ## Done
+- **Formal verification: the capability and IPC paths, proved by Kani (2026-11-18, [RFC-0037](../lantern-rfcs/rfcs/0037-formal-verification-first-properties.md)/[ADR-0042](../lantern-rfcs/adr/0042-kani-proofs-of-the-kernel.md)).** RFC-0037's nine
+  properties hold, within its bounds, in 84 harnesses (`src/proofs/`, `scripts/prove.sh`; about 9 hours): no capability
+  amplified or forged; IPC transfer only with `GRANT`, exactly; lookups confined to the caller's CSpace; `Reset` leaves
+  nothing dangling and destroys exactly what came from the `Untyped`; every system call and trap keeps W (`src/wf.rs`,
+  also checked at run time in debug builds); bystanders' registers untouched; no panics. To make the kernel provable,
+  every pooled object is reached through `Pool::with`/`with_mut` and `CNode::set` (about 90 call sites), and Kani
+  proves those agree with the plain lookups. **Found and fixed:** `Untyped::bump` could overflow; a thread whose own
+  CSpace, scheduling context or VSpace `Reset` destroyed stayed current, naming freed slots; a capability in flight
+  survived `Reset` of its object. Each has a host test (107 in all). Five reintroduced bugs each fail the right proof.
 - Kernel scope fixed to five responsibilities ([RFC-0002](../lantern-rfcs/rfcs/0002-microkernel-architecture.md), Accepted; see [ADR-0004](../lantern-rfcs/adr/0004-kernel-responsibilities-and-tcb-boundary.md)).
 - Object model sketched and reviewed ([ARCHITECTURE.md](./ARCHITECTURE.md)); fixed a "TCB" (Trusted Computing Base vs. thread control block) terminology collision during review.
 - Component threat model drafted and reviewed ([THREAT_MODEL.md](./THREAT_MODEL.md)).

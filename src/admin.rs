@@ -54,18 +54,18 @@ pub fn untyped_retype(
 
     // Validate everything before allocating anything, so a failure never leaves an
     // allocated pool slot with no capability pointing at it.
-    let untyped = state.untypeds.get(untyped_id.0 as usize).ok_or(SyscallError::InvalidCapability)?;
-    if untyped.remaining == 0 {
+    let remaining = state.untypeds.with(untyped_id.0 as usize, |u| u.remaining).ok_or(SyscallError::InvalidCapability)?;
+    if remaining == 0 {
         return Err(SyscallError::NotEnoughMemory);
     }
     let cspace_id = state
         .tcbs
-        .get(current.0 as usize)
-        .and_then(|t| t.cspace)
+        .with(current.0 as usize, |t| t.cspace)
+        .flatten()
         .ok_or(SyscallError::FailedLookup)?;
     {
-        let cnode = state.cnodes.get(cspace_id.0 as usize).ok_or(SyscallError::FailedLookup)?;
-        let dest_cap = cnode.get(dest).ok_or(SyscallError::RangeError)?;
+        let dest_cap =
+            state.cnodes.with(cspace_id.0 as usize, |c| c.get(dest)).ok_or(SyscallError::FailedLookup)?.ok_or(SyscallError::RangeError)?;
         if dest_cap != Capability::Null {
             return Err(SyscallError::IllegalOperation);
         }
@@ -112,15 +112,16 @@ pub fn untyped_retype(
         }
         ObjectType::FrameSmall | ObjectType::FrameMega => {
             let size = if object_type == ObjectType::FrameSmall { FrameSize::Small } else { FrameSize::Mega };
-            let untyped = state.untypeds.get_mut(untyped_id.0 as usize).expect("checked above");
-            let (device, dma) = (untyped.device, untyped.dma);
-            let paddr = untyped.bump(size.bytes(), size.bytes()).ok_or(SyscallError::NotEnoughMemory)?;
+            let (device, dma, paddr) = state
+                .untypeds
+                .with_mut(untyped_id.0 as usize, |u| (u.device, u.dma, u.bump(size.bytes(), size.bytes())))
+                .expect("checked above");
+            let paddr = paddr.ok_or(SyscallError::NotEnoughMemory)?;
             // RFC-0030: no program is ever handed another's old memory. RAM is zeroed here, by the kernel, whoever holds
             // the Untyped; a device's memory is never written.
             if !device {
                 let window = ram_window(paddr, size.bytes()).ok_or(SyscallError::InvalidArgument)?;
-                // SAFETY: `window` addresses exactly this Frame's freshly bumped RAM, which nothing maps or holds yet.
-                unsafe { core::ptr::write_bytes(window as *mut u8, 0, size.bytes()) };
+                zero_ram(window, size.bytes());
             }
             let idx = state
                 .frames
@@ -137,9 +138,11 @@ pub fn untyped_retype(
             if size == 0 || !size.is_multiple_of(mega) {
                 return Err(SyscallError::InvalidArgument);
             }
-            let parent = state.untypeds.get_mut(untyped_id.0 as usize).expect("checked above");
-            let (device, dma, budget) = (parent.device, parent.dma, parent.budget());
-            let base = parent.bump(size, mega).ok_or(SyscallError::NotEnoughMemory)?;
+            let (device, dma, budget, base) = state
+                .untypeds
+                .with_mut(untyped_id.0 as usize, |p| (p.device, p.dma, p.budget(), p.bump(size, mega)))
+                .expect("checked above");
+            let base = base.ok_or(SyscallError::NotEnoughMemory)?;
             let mut child =
                 if device { Untyped::device(budget, base, size) } else { Untyped::with_memory(budget, base, size) };
             child.origin = Some(untyped_id);
@@ -153,9 +156,9 @@ pub fn untyped_retype(
     // Neither of these can fail now: the destination slot was checked empty above
     // and nothing else could have touched it since (single-stack, non-reentrant —
     // ADR-0010).
-    let cnode = state.cnodes.get_mut(cspace_id.0 as usize).expect("checked above");
-    *cnode.slot_mut(dest).expect("checked above") = new_cap;
-    state.untypeds.get_mut(untyped_id.0 as usize).expect("checked above").remaining -= 1;
+    let placed = state.cnodes.with_mut(cspace_id.0 as usize, |c| c.set(dest, new_cap));
+    assert!(placed == Some(true), "checked above");
+    state.untypeds.with_mut(untyped_id.0 as usize, |u| u.remaining -= 1).expect("checked above");
 
     abi::reply_success(frame);
     Ok(())
@@ -178,6 +181,13 @@ fn record_origin(state: &mut KernelState, cap: &Capability, untyped: UntypedId) 
 
 /// Where the kernel can write a RAM page right now. On the host, where tests use their own memory as "physical", that's
 /// the address itself.
+/// Zeroes a fresh Frame's RAM through the kernel's window onto it. The Kani proofs (RFC-0037) replace this with a stub:
+/// it writes through a raw address, which is outside what they check.
+pub(crate) fn zero_ram(window: usize, len: usize) {
+    // SAFETY: `window` addresses exactly a Frame's freshly bumped RAM, which nothing maps or holds yet.
+    unsafe { core::ptr::write_bytes(window as *mut u8, 0, len) };
+}
+
 fn ram_window(paddr: usize, len: usize) -> Option<usize> {
     #[cfg(target_arch = "riscv64")]
     {
@@ -227,22 +237,22 @@ pub fn configure(
     } else {
         match state.lookup_cap(current, vspace_arg)? {
             Capability::VSpace { id, rights } if rights.contains(Rights::WRITE) => {
-                let vspace = state.vspaces.get(id.0 as usize).ok_or(SyscallError::InvalidCapability)?;
-                Some(vspace.root)
+                Some(state.vspaces.with(id.0 as usize, |v| v.root).ok_or(SyscallError::InvalidCapability)?)
             }
             Capability::VSpace { .. } => return Err(SyscallError::IllegalOperation),
             _ => return Err(SyscallError::InvalidCapability),
         }
     };
 
-    let was_inactive = {
-        let tcb = state.tcbs.get_mut(target.0 as usize).ok_or(SyscallError::InvalidCapability)?;
-        let was_inactive = tcb.state == ThreadState::Inactive;
-        tcb.cspace = Some(cspace_id);
-        tcb.sched_context = Some(sched_id);
-        tcb.address_space = address_space;
-        was_inactive
-    };
+    let was_inactive = state
+        .tcbs
+        .with_mut(target.0 as usize, |tcb| {
+            tcb.cspace = Some(cspace_id);
+            tcb.sched_context = Some(sched_id);
+            tcb.address_space = address_space;
+            tcb.state == ThreadState::Inactive
+        })
+        .ok_or(SyscallError::InvalidCapability)?;
     if was_inactive {
         state.make_ready(target);
     }

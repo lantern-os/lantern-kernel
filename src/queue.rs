@@ -10,6 +10,62 @@ pub struct ArrayQueue<T: Copy, const N: usize> {
 }
 
 impl<T: Copy, const N: usize> ArrayQueue<T, N> {
+    /// Every element access goes through these two. Under Kani (RFC-0037) they find the slot by comparison: the queue's
+    /// position is often arbitrary there, and an access at an offset Kani can't resolve makes every later read of the
+    /// kernel state a selection over all of it. That both versions agree is proved (`proofs::queue_access_agrees`).
+    #[cfg(not(kani))]
+    fn get_at(&self, i: usize) -> Option<T> {
+        self.items[i]
+    }
+
+    #[cfg(not(kani))]
+    fn set_at(&mut self, i: usize, value: Option<T>) {
+        self.items[i] = value;
+    }
+
+    #[cfg(kani)]
+    fn get_at(&self, i: usize) -> Option<T> {
+        assert!(i < N, "index out of bounds");
+        let mut value = None;
+        for j in 0..N {
+            if j == i {
+                value = self.items[j];
+            }
+        }
+        value
+    }
+
+    #[cfg(kani)]
+    fn set_at(&mut self, i: usize, value: Option<T>) {
+        assert!(i < N, "index out of bounds");
+        for j in 0..N {
+            if j == i {
+                self.items[j] = value;
+            }
+        }
+    }
+
+    /// The direct accesses, kept under Kani for `proofs::queue_access_agrees`.
+    #[cfg(kani)]
+    pub fn get_by_index(&self, i: usize) -> Option<T> {
+        self.items[i]
+    }
+
+    #[cfg(kani)]
+    pub fn set_by_index(&mut self, i: usize, value: Option<T>) {
+        self.items[i] = value;
+    }
+
+    #[cfg(kani)]
+    pub fn get_at_for_proof(&self, i: usize) -> Option<T> {
+        self.get_at(i)
+    }
+
+    #[cfg(kani)]
+    pub fn set_at_for_proof(&mut self, i: usize, value: Option<T>) {
+        self.set_at(i, value)
+    }
+
     pub const fn new() -> Self {
         Self { items: [None; N], head: 0, len: 0 }
     }
@@ -35,8 +91,29 @@ impl<T: Copy, const N: usize> ArrayQueue<T, N> {
         if self.len == 0 {
             None
         } else {
-            self.items[self.head]
+            self.get_at(self.head)
         }
+    }
+
+    /// The `k`-th element from the front. For [`crate::wf`]'s checks: nothing in the kernel's own logic walks a queue.
+    pub fn nth(&self, k: usize) -> Option<T> {
+        if k < self.len {
+            self.get_at((self.head + k) % N)
+        } else {
+            None
+        }
+    }
+
+    /// Whether the representation is consistent: exactly the `len` slots from `head` are occupied.
+    pub fn consistent(&self) -> bool {
+        if self.len > N || self.head >= N.max(1) {
+            return false;
+        }
+        let mut ok = true;
+        for i in 0..N {
+            ok &= self.get_at((self.head + i) % N).is_some() == (i < self.len);
+        }
+        ok
     }
 
     pub fn push_back(&mut self, value: T) -> bool {
@@ -44,7 +121,7 @@ impl<T: Copy, const N: usize> ArrayQueue<T, N> {
             return false;
         }
         let idx = (self.head + self.len) % N;
-        self.items[idx] = Some(value);
+        self.set_at(idx, Some(value));
         self.len += 1;
         true
     }
@@ -53,7 +130,8 @@ impl<T: Copy, const N: usize> ArrayQueue<T, N> {
         if self.len == 0 {
             return None;
         }
-        let value = self.items[self.head].take();
+        let value = self.get_at(self.head);
+        self.set_at(self.head, None);
         self.head = (self.head + 1) % N;
         self.len -= 1;
         value
@@ -73,12 +151,13 @@ impl<T: Copy + PartialEq, const N: usize> ArrayQueue<T, N> {
         let mut new_len = 0;
         for i in 0..self.len {
             let idx = (self.head + i) % N;
-            let item = self.items[idx].take();
+            let item = self.get_at(idx);
+            self.set_at(idx, None);
             if !found && item == Some(value) {
                 found = true;
                 continue;
             }
-            self.items[write] = item;
+            self.set_at(write, item);
             write = (write + 1) % N;
             new_len += 1;
         }

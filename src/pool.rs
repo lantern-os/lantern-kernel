@@ -27,32 +27,124 @@ impl<T: Copy, const N: usize> Pool<T, N> {
         self.len >= N
     }
 
+    /// A pool holding exactly `slots`. For the Kani proofs (RFC-0037), which build arbitrary pools directly.
+    #[cfg(kani)]
+    pub fn from_slots(slots: [Option<T>; N]) -> Self {
+        let mut len = 0;
+        for slot in &slots {
+            if slot.is_some() {
+                len += 1;
+            }
+        }
+        Self { slots, len }
+    }
+
+    /// Whether `len` matches the occupied slots. For [`crate::wf`].
+    pub fn consistent(&self) -> bool {
+        let mut occupied = 0;
+        for i in 0..N {
+            occupied += usize::from(self.slots[i].is_some());
+        }
+        occupied == self.len
+    }
+
     /// Allocates `value` into the first free slot, returning its stable index.
     pub fn alloc(&mut self, value: T) -> Option<usize> {
         if self.is_full() {
             return None;
         }
-        let (index, slot) = self.slots.iter_mut().enumerate().find(|(_, s)| s.is_none())?;
-        *slot = Some(value);
-        self.len += 1;
-        Some(index)
+        // The first free slot, written in place: a reference to it, found by an iterator, would put the write at an
+        // offset the Kani proofs can't resolve (RFC-0037).
+        for i in 0..N {
+            if self.slots[i].is_none() {
+                self.slots[i] = Some(value);
+                self.len += 1;
+                return Some(i);
+            }
+        }
+        None
     }
 
+    #[cfg(not(kani))]
     pub fn get(&self, index: usize) -> Option<&T> {
         self.slots.get(index)?.as_ref()
     }
 
+    #[cfg(not(kani))]
     pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
         self.slots.get_mut(index)?.as_mut()
     }
 
-    /// Frees the slot at `index`, returning its value if it was occupied.
-    pub fn free(&mut self, index: usize) -> Option<T> {
-        let value = self.slots.get_mut(index)?.take();
-        if value.is_some() {
-            self.len -= 1;
+    // Under Kani (RFC-0037) there's no `get` or `get_mut`: a reference returned from a lookup with an arbitrary index
+    // points at an offset the proofs can't resolve, and every later access through it, or of the kernel state at all,
+    // becomes a selection over all of it. Only `with` and `with_mut` remain, so the compiler finds every such lookup.
+
+    /// The lookups that run outside Kani, kept under Kani for `proofs::pool_lookups_agree`.
+    #[cfg(kani)]
+    pub fn get_by_index(&self, index: usize) -> Option<&T> {
+        self.slots.get(index)?.as_ref()
+    }
+
+    #[cfg(kani)]
+    pub fn get_mut_by_index(&mut self, index: usize) -> Option<&mut T> {
+        self.slots.get_mut(index)?.as_mut()
+    }
+
+    /// Applies `f` to the object at `index`, if there is one. The kernel reads and writes objects through these two, not
+    /// through a reference it keeps: under Kani (RFC-0037), `f` then runs at a concrete address. A reference kept past a
+    /// lookup with an arbitrary index points at an offset the proofs can't resolve, which makes every later read of the
+    /// kernel state a selection over all of it.
+    #[cfg(not(kani))]
+    pub fn with<R>(&self, index: usize, f: impl FnOnce(&T) -> R) -> Option<R> {
+        self.get(index).map(f)
+    }
+
+    /// As [`Self::with`], to change the object.
+    #[cfg(not(kani))]
+    pub fn with_mut<R>(&mut self, index: usize, f: impl FnOnce(&mut T) -> R) -> Option<R> {
+        self.get_mut(index).map(f)
+    }
+
+    #[cfg(kani)]
+    pub fn with<R>(&self, index: usize, f: impl FnOnce(&T) -> R) -> Option<R> {
+        for i in 0..N {
+            if i == index {
+                return self.slots[i].as_ref().map(f);
+            }
         }
-        value
+        None
+    }
+
+    #[cfg(kani)]
+    pub fn with_mut<R>(&mut self, index: usize, f: impl FnOnce(&mut T) -> R) -> Option<R> {
+        for i in 0..N {
+            if i == index {
+                return self.slots[i].as_mut().map(f);
+            }
+        }
+        None
+    }
+
+    /// Whether `index` names a live object.
+    pub fn contains(&self, index: usize) -> bool {
+        self.with(index, |_| ()).is_some()
+    }
+
+    /// Frees the slot at `index`, returning its value if it was occupied.
+    ///
+    /// By comparison, not by indexing, in every build: an index the Kani proofs can't resolve would put the write at an
+    /// offset they can't either (RFC-0037), and freeing is rare.
+    pub fn free(&mut self, index: usize) -> Option<T> {
+        for i in 0..N {
+            if i == index {
+                let value = self.slots[i].take();
+                if value.is_some() {
+                    self.len -= 1;
+                }
+                return value;
+            }
+        }
+        None
     }
 }
 

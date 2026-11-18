@@ -205,12 +205,79 @@ impl CNode {
         Self { slots: [Capability::Null; CNODE_SLOTS] }
     }
 
+    #[cfg(not(kani))]
     pub fn get(&self, cptr: CPtr) -> Option<Capability> {
         self.slots.get(cptr).copied()
     }
 
+    #[cfg(not(kani))]
     pub fn slot_mut(&mut self, cptr: CPtr) -> Option<&mut Capability> {
         self.slots.get_mut(cptr)
+    }
+
+    /// Writes `cap` into slot `cptr`: `false` if there's no such slot.
+    #[cfg(not(kani))]
+    pub fn set(&mut self, cptr: CPtr, cap: Capability) -> bool {
+        match self.slots.get_mut(cptr) {
+            Some(slot) => {
+                *slot = cap;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Under Kani (RFC-0037), the same lookups by comparing against each slot in turn, as for `crate::pool::Pool::get`:
+    /// a write at an offset Kani can't resolve makes every later read of the kernel state a selection over all of it.
+    /// That these agree with the lookups above is proved (`proofs::cnode_lookups_agree`).
+    #[cfg(kani)]
+    pub fn get(&self, cptr: CPtr) -> Option<Capability> {
+        for i in 0..CNODE_SLOTS {
+            if i == cptr {
+                return Some(self.slots[i]);
+            }
+        }
+        None
+    }
+
+    /// Writes `cap` into slot `cptr`: `false` if there's no such slot. Writing in place, rather than through a
+    /// reference, keeps the write at a concrete address under Kani (see `Pool::with`).
+    #[cfg(kani)]
+    pub fn set(&mut self, cptr: CPtr, cap: Capability) -> bool {
+        for i in 0..CNODE_SLOTS {
+            if i == cptr {
+                self.slots[i] = cap;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether every slot holds the same capability. For the Kani proofs.
+    #[cfg(kani)]
+    pub fn slots_eq(&self, other: &Self) -> bool {
+        let mut same = true;
+        for i in 0..CNODE_SLOTS {
+            same &= self.slots[i] == other.slots[i];
+        }
+        same
+    }
+
+    /// The accesses that run outside Kani, kept under Kani for `proofs::cnode_lookups_agree`.
+    #[cfg(kani)]
+    pub fn get_by_index(&self, cptr: CPtr) -> Option<&Capability> {
+        self.slots.get(cptr)
+    }
+
+    #[cfg(kani)]
+    pub fn set_by_index(&mut self, cptr: CPtr, cap: Capability) -> bool {
+        match self.slots.get_mut(cptr) {
+            Some(slot) => {
+                *slot = cap;
+                true
+            }
+            None => false,
+        }
     }
 }
 

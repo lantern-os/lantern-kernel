@@ -12,3 +12,7 @@ path = "src/lib.rs"
 
 [dependencies]
 lantern-hal = { git = "https://github.com/lantern-os/lantern-hal", branch = "main" }
+
+[lints.rust]
+# RFC-0037: the Kani proofs and their reduced limits are compiled only under `cfg(kani)`.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }

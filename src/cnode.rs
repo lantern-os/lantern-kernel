@@ -53,23 +53,23 @@ pub fn invoke(
         LABEL_COPY_CROSS => copy_cross(state, current, target, src, dest, arg3)?,
         // RFC-0030: `Revoke` on an `Untyped` is `Reset`: everything made from it is destroyed, and it's empty again.
         // On anything else it's still refused: there's no general derivation tree.
-        LABEL_REVOKE if matches!(
-            state.cnodes.get(target.0 as usize).and_then(|c| c.get(src)),
-            Some(Capability::Untyped { rights, .. }) if rights.contains(Rights::WRITE)
-        ) =>
-        {
-            let Some(Capability::Untyped { id, .. }) = state.cnodes.get(target.0 as usize).and_then(|c| c.get(src)) else {
-                unreachable!("matched above")
-            };
-            crate::reclaim::reset(state, id)?;
-        }
-        LABEL_REVOKE => {
+        LABEL_REVOKE => match state.cnodes.with(target.0 as usize, |c| c.get(src)).flatten() {
+            Some(Capability::Untyped { id, rights }) if rights.contains(Rights::WRITE) => {
+                crate::reclaim::reset(state, id)?;
+                if state.scheduler.current.is_none() {
+                    // The caller lost what it ran on and was suspended (or destroyed). Its registers, with this call's
+                    // answer, are saved: reconfigured later, it resumes from here, not from wherever it last switched.
+                    abi::reply_success(frame);
+                    state.tcbs.with_mut(current.0 as usize, |t| t.context = crate::object::SavedContext::save_from(frame));
+                    return Ok(());
+                }
+            }
             // Recursive revocation needs a capability-derivation tree Phase 1
             // doesn't track yet (RFC-0005 already named "revocation cost model" as
             // an open question) — refuse cleanly rather than silently no-op or
             // panic.
-            return Err(SyscallError::IllegalOperation);
-        }
+            _ => return Err(SyscallError::IllegalOperation),
+        },
         _ => return Err(SyscallError::InvalidArgument),
     }
     abi::reply_success(frame);
@@ -90,23 +90,38 @@ fn mint(
     let new_rights = Rights::from_bits_truncate((packed & 0xFF) as u8);
     let badge = (packed >> 8) as u64;
 
-    let cnode = state.cnodes.get_mut(target.0 as usize).ok_or(SyscallError::InvalidCapability)?;
-    let source_cap = cnode.get(src).ok_or(SyscallError::RangeError)?;
-    if source_cap == Capability::Null {
-        return Err(SyscallError::InvalidCapability);
-    }
+    let source_cap = source(state, target, src)?;
     // Monotone attenuation (ADR-0005): mint may only narrow rights, never widen.
     if !new_rights.is_subset_of(source_cap.rights()) {
         return Err(SyscallError::IllegalOperation);
     }
     let minted = attenuate(source_cap, new_rights, badge)?;
+    place(state, target, dest, minted)
+}
 
-    let dest_slot = cnode.slot_mut(dest).ok_or(SyscallError::RangeError)?;
-    if *dest_slot != Capability::Null {
-        return Err(SyscallError::IllegalOperation);
+/// The capability in `cnode`'s slot `src`, which must exist and not be empty.
+fn source(state: &KernelState, cnode: CNodeId, src: usize) -> Result<Capability, SyscallError> {
+    match state.cnodes.with(cnode.0 as usize, |c| c.get(src)) {
+        None => Err(SyscallError::InvalidCapability),
+        Some(None) => Err(SyscallError::RangeError),
+        Some(Some(Capability::Null)) => Err(SyscallError::InvalidCapability),
+        Some(Some(cap)) => Ok(cap),
     }
-    *dest_slot = minted;
-    Ok(())
+}
+
+/// Puts `cap` in `cnode`'s slot `dest`, which must exist and be empty.
+fn place(state: &mut KernelState, cnode: CNodeId, dest: usize, cap: Capability) -> Result<(), SyscallError> {
+    state
+        .cnodes
+        .with_mut(cnode.0 as usize, |c| match c.get(dest) {
+            None => Err(SyscallError::RangeError),
+            Some(Capability::Null) => {
+                c.set(dest, cap);
+                Ok(())
+            }
+            Some(_) => Err(SyscallError::IllegalOperation),
+        })
+        .ok_or(SyscallError::InvalidCapability)?
 }
 
 fn attenuate(source: Capability, rights: Rights, badge: u64) -> Result<Capability, SyscallError> {
@@ -127,33 +142,14 @@ fn attenuate(source: Capability, rights: Rights, badge: u64) -> Result<Capabilit
 }
 
 fn copy(state: &mut KernelState, target: CNodeId, src: usize, dest: usize) -> Result<(), SyscallError> {
-    let cnode = state.cnodes.get_mut(target.0 as usize).ok_or(SyscallError::InvalidCapability)?;
-    let source_cap = cnode.get(src).ok_or(SyscallError::RangeError)?;
-    if source_cap == Capability::Null {
-        return Err(SyscallError::InvalidCapability);
-    }
-    let dest_slot = cnode.slot_mut(dest).ok_or(SyscallError::RangeError)?;
-    if *dest_slot != Capability::Null {
-        return Err(SyscallError::IllegalOperation);
-    }
-    *dest_slot = source_cap;
-    Ok(())
+    let cap = source(state, target, src)?;
+    place(state, target, dest, cap)
 }
 
 fn move_cap(state: &mut KernelState, target: CNodeId, src: usize, dest: usize) -> Result<(), SyscallError> {
-    let cnode = state.cnodes.get_mut(target.0 as usize).ok_or(SyscallError::InvalidCapability)?;
-    let source_cap = cnode.get(src).ok_or(SyscallError::RangeError)?;
-    if source_cap == Capability::Null {
-        return Err(SyscallError::InvalidCapability);
-    }
-    {
-        let dest_slot = cnode.slot_mut(dest).ok_or(SyscallError::RangeError)?;
-        if *dest_slot != Capability::Null {
-            return Err(SyscallError::IllegalOperation);
-        }
-        *dest_slot = source_cap;
-    }
-    *cnode.slot_mut(src).expect("src was already validated above") = Capability::Null;
+    let cap = source(state, target, src)?;
+    place(state, target, dest, cap)?;
+    state.cnodes.with_mut(target.0 as usize, |c| c.set(src, Capability::Null));
     Ok(())
 }
 
@@ -162,12 +158,8 @@ fn move_cap(state: &mut KernelState, target: CNodeId, src: usize, dest: usize) -
 /// that leaves `Revoke` stubbed). A Phase 1 prototype demo doesn't churn objects
 /// enough for pool exhaustion to matter; tracked in `lantern-kernel/STATUS.md`.
 fn delete(state: &mut KernelState, target: CNodeId, src: usize) -> Result<(), SyscallError> {
-    let cnode = state.cnodes.get_mut(target.0 as usize).ok_or(SyscallError::InvalidCapability)?;
-    let slot = cnode.slot_mut(src).ok_or(SyscallError::RangeError)?;
-    if *slot == Capability::Null {
-        return Err(SyscallError::InvalidCapability);
-    }
-    *slot = Capability::Null;
+    source(state, target, src)?;
+    state.cnodes.with_mut(target.0 as usize, |c| c.set(src, Capability::Null));
     Ok(())
 }
 
@@ -203,23 +195,8 @@ fn copy_cross(
         Capability::CNode(id) => id,
         _ => return Err(SyscallError::InvalidCapability),
     };
-    let source_cap = state
-        .cnodes
-        .get(source_id.0 as usize)
-        .ok_or(SyscallError::InvalidCapability)?
-        .get(source_slot)
-        .ok_or(SyscallError::RangeError)?;
-    if source_cap == Capability::Null {
-        return Err(SyscallError::InvalidCapability);
-    }
-
-    let target_cnode = state.cnodes.get_mut(target.0 as usize).ok_or(SyscallError::InvalidCapability)?;
-    let dest_slot = target_cnode.slot_mut(dest).ok_or(SyscallError::RangeError)?;
-    if *dest_slot != Capability::Null {
-        return Err(SyscallError::IllegalOperation);
-    }
-    *dest_slot = source_cap;
-    Ok(())
+    let cap = source(state, source_id, source_slot)?;
+    place(state, target, dest, cap)
 }
 
 #[cfg(test)]
