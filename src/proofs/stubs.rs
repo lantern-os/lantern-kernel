@@ -31,7 +31,7 @@ pub unsafe fn translate(_root: *const Riscv64PageTable, _vaddr: usize) -> Option
 
 pub unsafe fn share_root_entry(_dst: *mut Riscv64PageTable, _src: *const Riscv64PageTable, _index: usize) {}
 
-pub unsafe fn for_each_table(_root: *const Riscv64PageTable, _skip: usize, _f: &mut dyn FnMut(usize)) {}
+pub unsafe fn for_each_table(_root: *const Riscv64PageTable, _skip_first: usize, _skip_count: usize, _f: &mut dyn FnMut(usize)) {}
 
 pub fn zero_ram(_window: usize, _len: usize) {}
 

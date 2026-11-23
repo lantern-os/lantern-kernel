@@ -160,13 +160,12 @@ fn map(
     // SAFETY: `root` as above; `alloc` returns a distinct fresh page per call (up
     // to `max_new_tables` calls, exactly what each walk can possibly make) —
     // `KernelPageTables`'s bump pointer never repeats, per its own contract.
+    // RFC-0039 §5: a DMA frame is mapped non-cacheable where the machine maps DMA uncached, wherever it's mapped, so
+    // neither its holder nor a device ever sees a stale copy.
+    let flags = perms.to_pte_flags().union(if f.dma { lantern_hal::riscv64_dma_pte_flags() } else { lantern_hal::Riscv64PteFlags::NONE });
     match size {
-        FrameSize::Small => unsafe {
-            lantern_hal::riscv64_map_page(root, vaddr, paddr, perms.to_pte_flags(), &mut alloc)
-        },
-        FrameSize::Mega => unsafe {
-            lantern_hal::riscv64_map_megapage(root, vaddr, paddr, perms.to_pte_flags(), &mut alloc)
-        },
+        FrameSize::Small => unsafe { lantern_hal::riscv64_map_page(root, vaddr, paddr, flags, &mut alloc) },
+        FrameSize::Mega => unsafe { lantern_hal::riscv64_map_megapage(root, vaddr, paddr, flags, &mut alloc) },
     }
 
     // The spares were bumped consecutively and handed out in order, so the unused
@@ -527,5 +526,34 @@ mod tests {
         admin::untyped_retype(&mut state, tcb, 1, &mut retype).unwrap();
         let Capability::Frame { id: frame, .. } = state.lookup_cap(tcb, 4).unwrap() else { panic!() };
         assert_eq!(address(&mut state, tcb, 4), Ok(state.frames.get(frame.0 as usize).unwrap().paddr));
+    }
+
+    /// RFC-0039 §5: on a platform that maps DMA uncached, a DMA frame is mapped non-cacheable and an ordinary one isn't.
+    /// The only test that maps a DMA frame, so the host switch can't race another.
+    #[test]
+    fn a_dma_frame_is_mapped_non_cacheable_where_the_platform_says() {
+        let mut arena = TestArena([0; 64 * 1024]);
+        let (mut state, tcb, frame_cptr, vspace_cptr) = setup(&mut arena);
+        let Capability::VSpace { id: vspace_id, .. } = state.lookup_cap(tcb, vspace_cptr).unwrap() else { panic!() };
+        let root = state.vspaces.get(vspace_id.0 as usize).unwrap().root as *const lantern_hal::Riscv64PageTable;
+        let Capability::Untyped { id, .. } = state.lookup_cap(tcb, 1).unwrap() else { panic!() };
+        state.untypeds.get_mut(id.0 as usize).unwrap().dma = true;
+        let mut retype = TrapFrame::zeroed();
+        retype.set_mr(1, ObjectType::FrameSmall as usize);
+        retype.set_mr(2, 4);
+        admin::untyped_retype(&mut state, tcb, 1, &mut retype).unwrap();
+        let noncacheable = 1u64 << 61;
+        lantern_hal::riscv64_set_dma_uncached_for_tests(true);
+        for (cptr, vaddr) in [(frame_cptr, 0x1000_0000usize), (4, 0x1000_1000)] {
+            let mut frame = map_frame(PermFlags::READ | PermFlags::WRITE);
+            frame.set_mr(1, vspace_cptr);
+            frame.set_mr(2, vaddr);
+            invoke(&mut state, tcb, cptr, &mut frame).unwrap();
+        }
+        lantern_hal::riscv64_set_dma_uncached_for_tests(false);
+        // SAFETY: `root` is this test's own retyped VSpace's real backing page.
+        let (ordinary, dma) = unsafe { (lantern_hal::riscv64_leaf_flags(root, 0x1000_0000), lantern_hal::riscv64_leaf_flags(root, 0x1000_1000)) };
+        assert_eq!(ordinary.map(|f| f & noncacheable), Some(0), "ordinary memory stays cacheable");
+        assert_eq!(dma.map(|f| f & noncacheable), Some(noncacheable), "the DMA frame is non-cacheable");
     }
 }
