@@ -122,6 +122,12 @@ pub fn untyped_retype(
             if !device {
                 let window = ram_window(paddr, size.bytes()).ok_or(SyscallError::InvalidArgument)?;
                 zero_ram(window, size.bytes());
+                // RFC-0039 §5: zeroed through the cacheable direct map, so cleaned out of the caches before any device
+                // sees it, where DMA is mapped uncached: a dirty line written back later would overwrite what the
+                // device wrote.
+                if dma {
+                    lantern_hal::riscv64_flush_for_dma(window, size.bytes());
+                }
             }
             let idx = state
                 .frames

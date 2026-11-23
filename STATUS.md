@@ -5,6 +5,9 @@
 **Roadmap:** Phase 3 closed and Phase 4 (hardware and assurance) opened, 2026-11-16, per [RFC-0036](../lantern-rfcs/rfcs/0036-phase-3-to-phase-4-transition.md)/[ADR-0041](../lantern-rfcs/adr/0041-phase-3-complete-phase-4-opened.md).
 
 ## Done
+- **Bring-up groundwork (2026-11-23, [RFC-0039](../lantern-rfcs/rfcs/0039-bring-up-on-the-k3-pico-itx.md)).** The direct map spans as many root entries as boot's RAM needs (shared, never
+  freed with a VSpace); DMA frames map with the HAL's DMA flags and are flushed after zeroing. Tests at QEMU's layout and
+  the K3's (8 GiB above 4 GiB). `riscv64_for_each_table` now skips a range of root entries; its Kani stub follows.
 - **Formal verification: the capability and IPC paths, proved by Kani (2026-11-18, [RFC-0037](../lantern-rfcs/rfcs/0037-formal-verification-first-properties.md)/[ADR-0042](../lantern-rfcs/adr/0042-kani-proofs-of-the-kernel.md)).** RFC-0037's nine
   properties hold, within its bounds, in 84 harnesses (`src/proofs/`, `scripts/prove.sh`; about 9 hours): no capability
   amplified or forged; IPC transfer only with `GRANT`, exactly; lookups confined to the caller's CSpace; `Reset` leaves

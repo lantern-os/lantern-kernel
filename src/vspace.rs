@@ -58,23 +58,25 @@ pub fn install_direct_map(state: &mut KernelState) -> bool {
     if state.kernel_template.direct_root.is_some() {
         return true;
     }
-    // The root, and the one L1 table all 512 megapages share.
-    if state.kernel_page_tables.available() < 2 {
+    let (ram, span) = lantern_hal::riscv64_direct_map();
+    let entries = lantern_hal::riscv64_direct_map_root_entries();
+    // The root, and one L1 table for each GiB the megapages span.
+    if span == 0 || state.kernel_page_tables.available() < 1 + entries {
         return false;
     }
     let root = state.kernel_page_tables.alloc().expect("checked available");
     let flags = Riscv64PteFlags::READ.union(Riscv64PteFlags::WRITE);
     let mega = lantern_hal::RISCV64_MEGAPAGE_SIZE;
     let tables = &mut state.kernel_page_tables;
-    let mut alloc = || tables.alloc().expect("checked available: one L1 table at most");
-    for i in 0..lantern_hal::RISCV64_DIRECT_MAP_SPAN / mega {
+    let mut alloc = || tables.alloc().expect("checked available: one L1 table per GiB");
+    for i in 0..span / mega {
         // SAFETY: `root` was just allocated, zeroed, from the kernel's own page-table pool; the addresses are megapage
-        // aligned constants, all in one 1 GiB region, so at most one table is allocated.
+        // aligned (`riscv64_set_direct_map` checked), in `entries` 1 GiB regions, so at most `entries` tables are allocated.
         unsafe {
             lantern_hal::riscv64_map_megapage(
                 root as *mut Riscv64PageTable,
                 lantern_hal::RISCV64_DIRECT_MAP_BASE + i * mega,
-                lantern_hal::RISCV64_DIRECT_MAP_RAM_BASE + i * mega,
+                ram + i * mega,
                 flags,
                 &mut alloc,
             )
@@ -106,14 +108,14 @@ pub fn populate(state: &mut KernelState, root: usize) -> Result<(), SyscallError
         unsafe { lantern_hal::riscv64_map_megapage(root as *mut Riscv64PageTable, vaddr, paddr, flags, &mut alloc) };
     }
     if let Some(direct) = template.direct_root {
-        // SAFETY: both are root tables from the kernel's own pool, and the shared entry holds only the direct map.
-        unsafe {
-            lantern_hal::riscv64_share_root_entry(
-                root as *mut Riscv64PageTable,
-                direct as *const Riscv64PageTable,
-                lantern_hal::RISCV64_DIRECT_MAP_ROOT_INDEX,
-            )
-        };
+        for index in lantern_hal::RISCV64_DIRECT_MAP_ROOT_INDEX..lantern_hal::RISCV64_DIRECT_MAP_ROOT_INDEX
+            + lantern_hal::riscv64_direct_map_root_entries()
+        {
+            // SAFETY: both are root tables from the kernel's own pool, and the shared entries hold only the direct map.
+            unsafe {
+                lantern_hal::riscv64_share_root_entry(root as *mut Riscv64PageTable, direct as *const Riscv64PageTable, index)
+            };
+        }
     }
     Ok(())
 }
@@ -124,12 +126,17 @@ pub fn free_tables(state: &mut KernelState, root: usize) {
     let mut count = 0;
     // SAFETY: `root` is a VSpace root from the kernel's pool, whose tables are all from that pool too.
     unsafe {
-        lantern_hal::riscv64_for_each_table(root as *const Riscv64PageTable, lantern_hal::RISCV64_DIRECT_MAP_ROOT_INDEX, &mut |t| {
-            if count < owned.len() {
-                owned[count] = t;
-                count += 1;
-            }
-        })
+        lantern_hal::riscv64_for_each_table(
+            root as *const Riscv64PageTable,
+            lantern_hal::RISCV64_DIRECT_MAP_ROOT_INDEX,
+            lantern_hal::riscv64_direct_map_root_entries(),
+            &mut |t| {
+                if count < owned.len() {
+                    owned[count] = t;
+                    count += 1;
+                }
+            },
+        )
     };
     for &table in &owned[..count] {
         state.kernel_page_tables.free(table);
@@ -147,6 +154,8 @@ mod tests {
         let flags = Riscv64PteFlags::READ.union(Riscv64PteFlags::WRITE);
         assert!(add_kernel_megapage(&mut state, 0x8020_0000, 0x8020_0000, flags));
         assert!(add_kernel_megapage(&mut state, 0x1000_0000, 0x1000_0000, flags));
+        // QEMU's general memory, from 6 MiB into its RAM, for 1 GiB less that.
+        assert!(lantern_hal::riscv64_set_direct_map(0x8060_0000, (1 << 30) - (6 << 20)));
         assert!(install_direct_map(&mut state));
         let before = state.kernel_page_tables.in_use();
 
@@ -160,7 +169,7 @@ mod tests {
             assert_eq!(lantern_hal::riscv64_translate(r, 0x8020_1234), Some(0x8020_1234));
             assert_eq!(
                 lantern_hal::riscv64_translate(r, lantern_hal::RISCV64_DIRECT_MAP_BASE + 0x40_0010),
-                Some(lantern_hal::RISCV64_DIRECT_MAP_RAM_BASE + 0x40_0010)
+                Some(0x8060_0000 + 0x40_0010)
             );
         }
         free_tables(&mut state, root);
@@ -169,6 +178,32 @@ mod tests {
         let again = state.kernel_page_tables.alloc().unwrap();
         // SAFETY: as above.
         unsafe { assert_eq!(lantern_hal::riscv64_translate(again as *const Riscv64PageTable, 0x8020_0000), None) };
+
+        // The K3's RAM (RFC-0039): 8 GiB less 32 MiB, from above 4 GiB. In this test, not a parallel one, because the
+        // direct map's range is the HAL's, set once at boot.
+        let mut state = KernelState::new();
+        let (k3, span) = (0x1_0200_0000, (8 << 30) - (32 << 20));
+        assert!(lantern_hal::riscv64_set_direct_map(k3, span));
+        assert_eq!(lantern_hal::riscv64_direct_map_root_entries(), 8);
+        let before = state.kernel_page_tables.in_use();
+        assert!(install_direct_map(&mut state));
+        // The shared root, eight L1 tables, and the idle VSpace's root.
+        assert_eq!(state.kernel_page_tables.in_use(), before + 1 + 8 + 1);
+        let root = state.kernel_page_tables.alloc().unwrap();
+        populate(&mut state, root).unwrap();
+        let base = lantern_hal::RISCV64_DIRECT_MAP_BASE;
+        // SAFETY: as above.
+        unsafe {
+            let r = root as *const Riscv64PageTable;
+            assert_eq!(lantern_hal::riscv64_translate(r, base + 0x1234), Some(k3 + 0x1234));
+            assert_eq!(lantern_hal::riscv64_translate(r, base + span - 8), Some(k3 + span - 8), "the last byte");
+            assert_eq!(lantern_hal::riscv64_translate(r, base + span), None, "nothing past it");
+        }
+        let held = state.kernel_page_tables.in_use();
+        free_tables(&mut state, root);
+        assert_eq!(state.kernel_page_tables.in_use(), held - 1, "only the root: every direct-map table stays shared");
+        assert!(!lantern_hal::riscv64_set_direct_map(k3 + 4096, span), "unaligned");
+        assert!(!lantern_hal::riscv64_set_direct_map(k3, lantern_hal::RISCV64_DIRECT_MAP_MAX_SPAN + (2 << 20)), "too big");
     }
 
     #[test]
